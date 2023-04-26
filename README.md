@@ -21,7 +21,7 @@ An argument processor for parsing and managing arguments passed to the system li
 |----------|-------------|
 | HAB_DEBUG | Outputs debug information to stderr for debugging purposes |
 | HAB_DYNAMIC_LINKER | Specifies the dynamic linker to use when creating executables with shared libraries |
-| HAB_LD_RUN_PATH, LD_RUN_PATH | A list of directories containing runtime libraries, separated by ':'; also serves as a hint for including rpath entries for `--as-needed` libraries |
+| HAB_LD_RUN_PATH | A list of directories containing runtime libraries, separated by ':'; also serves as a hint for including rpath entries for `--as-needed` libraries |
 | HAB_ENFORCE_PURITY | Filters out all impure paths passed to the linker when set to '1' |
 | PREFIX | The installation folder for the current package being built |
 | TMP, TMPDIR, TEMP, TEMPDIR | Temporary directory folders |

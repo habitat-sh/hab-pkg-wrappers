@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 
 struct CCEnvironment {
@@ -40,7 +41,7 @@ impl Default for CCEnvironment {
     }
 }
 
-fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironment) -> String {
+fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironment) -> Vec<String> {
     let mut is_cxx = env.executable_name.ends_with("++");
 
     let mut add_start_files = true;
@@ -122,25 +123,45 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
         eprintln!("add_cxx_std_headers: {}", add_cxx_std_headers);
         eprintln!("filtered_cc_arguments: {:#?}", filtered_arguments);
     }
-    format!("{}", filtered_arguments.join(" "))
+    filtered_arguments
 }
 
 fn main() {
     let env = CCEnvironment::default();
-    println!(
-        "{}",
-        parse_cc_arguments(
-            std::env::args()
-                .skip(1)
-                .flat_map(|argument| {
-                    if argument.is_prefixed_with("@") {
-                        opts_parser::expand_argument(&argument, &env.common)
-                    } else {
-                        vec![argument]
-                    }
-                })
-                .into_iter(),
-            &env,
-        )
+    let mut args = std::env::args();
+    let mut executable = args.next().unwrap();
+    let mut program = args.next().expect("Wrapped program must be specified");
+
+    let parsed_arguments = parse_cc_arguments(
+        args.flat_map(|argument| {
+            if argument.is_prefixed_with("@") {
+                opts_parser::expand_argument(&argument, &env.common)
+            } else {
+                vec![argument]
+            }
+        })
+        .into_iter(),
+        &env,
     );
+
+    let mut command = Command::new(&program);
+    command.args(&parsed_arguments);
+    if env.common.is_debug {
+        eprintln!(
+            "original: {}",
+            std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+        );
+        eprintln!(
+            "wrapped: {} {}",
+            program,
+            parsed_arguments.join(" ")
+        );
+    }
+
+    // Replace the current process with the new program
+    let error = command.exec();
+
+    // If we reach this point, there was an error
+    eprintln!("{}: {}", executable, error);
+    std::process::exit(126);
 }

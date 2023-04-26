@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 use path_absolutize::Absolutize;
 
@@ -25,7 +26,6 @@ impl Default for LDEnvironment {
             common: CommonEnvironment::default(),
             dynamic_linker: std::env::var("HAB_DYNAMIC_LINKER").ok().map(PathBuf::from),
             ld_run_path: std::env::var("HAB_LD_RUN_PATH")
-                .or_else(|_| std::env::var("LD_RUN_PATH"))
                 .map(|value| {
                     value
                         .split(":")
@@ -382,7 +382,10 @@ struct LinkerState {
     is_copy_dt_needed_entries: bool,
 }
 
-fn parse_linker_arguments(arguments: impl Iterator<Item = String>, env: &LDEnvironment) -> String {
+fn parse_linker_arguments(
+    arguments: impl Iterator<Item = String>,
+    env: &LDEnvironment,
+) -> Vec<String> {
     let mut linker_state_stack = vec![];
     let mut current_linker_state = LinkerState::default();
     let mut filtered_arguments = vec![];
@@ -664,27 +667,47 @@ fn parse_linker_arguments(arguments: impl Iterator<Item = String>, env: &LDEnvir
         eprintln!("rpaths: {:#?}", rpaths);
         eprintln!("filtered_ld_arguments: {:#?}", filtered_arguments);
     }
-    format!("{}", filtered_arguments.join(" "))
+    filtered_arguments
 }
 
 fn main() {
     let env = LDEnvironment::default();
-    println!(
-        "{}",
-        parse_linker_arguments(
-            std::env::args()
-                .skip(1)
-                .flat_map(|argument| {
-                    if argument.is_prefixed_with("@") {
-                        opts_parser::expand_argument(&argument, &env.common)
-                    } else {
-                        vec![argument]
-                    }
-                })
-                .into_iter(),
-            &env,
-        )
+    let mut args = std::env::args();
+    let mut executable = args.next().unwrap();
+    let mut program = args.next().expect("Wrapped program must be specified");
+
+    let parsed_arguments = parse_linker_arguments(
+        args.flat_map(|argument| {
+            if argument.is_prefixed_with("@") {
+                opts_parser::expand_argument(&argument, &env.common)
+            } else {
+                vec![argument]
+            }
+        })
+        .into_iter(),
+        &env,
     );
+
+    // Unset the LD_RUN_PATH so it doesn't affect the wrapped linker
+    std::env::remove_var("LD_RUN_PATH");
+
+    let mut command = Command::new(&program);
+    command.args(&parsed_arguments);
+
+    if env.common.is_debug {
+        eprintln!(
+            "original: {}",
+            std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+        );
+        eprintln!("wrapped: {} {}", program, parsed_arguments.join(" "));
+    }
+
+    // Replace the current process with the new program
+    let error = command.exec();
+
+    // If we reach this point, there was an error
+    eprintln!("{}: {}", executable, error);
+    std::process::exit(126);
 }
 
 #[cfg(test)]
@@ -734,7 +757,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -773,7 +796,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 
     // This is the scenario when linking in libraries dynamically from other packages
@@ -810,7 +833,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -852,7 +875,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 
     #[test]
@@ -883,7 +906,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments,);
+        assert_eq!(result.join(" "), raw_link_arguments,);
     }
 
     #[test]
@@ -915,7 +938,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -955,7 +978,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments,);
+        assert_eq!(result.join(" "), raw_link_arguments,);
     }
 
     // This is the case when a binary/library links dynamically against one of it's own package's libraries
@@ -996,7 +1019,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -1042,7 +1065,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 
     #[test]
@@ -1075,7 +1098,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 
     #[test]
@@ -1110,7 +1133,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -1164,7 +1187,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -1192,7 +1215,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={} -rpath={}",
                 raw_link_arguments,
@@ -1249,7 +1272,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "{} -rpath={}",
                 raw_link_arguments,
@@ -1279,7 +1302,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "-lc -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm",
                 libc_search_path.display()
@@ -1325,7 +1348,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "-L {} -lc {}",
                 libc_search_path.display(),
@@ -1376,7 +1399,7 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(
-            result,
+            result.join(" "),
             format!(
                 "-plugin={} -plugin-opt=option3 -lz",
                 liblto_plugin.display()
@@ -1421,7 +1444,10 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, format!("-dynamic-linker={}", dynamic_linker.display()));
+        assert_eq!(
+            result.join(" "),
+            format!("-dynamic-linker={}", dynamic_linker.display())
+        );
 
         // Impure dynamic linker without env is ignored
         let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
@@ -1437,7 +1463,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, String::from(""));
+        assert_eq!(result.join(" "), String::from(""));
 
         // Pure dynamic linker is replaced by specified linker
         let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
@@ -1454,7 +1480,10 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, format!("-dynamic-linker={}", dynamic_linker_alternative.display()));
+        assert_eq!(
+            result.join(" "),
+            format!("-dynamic-linker={}", dynamic_linker_alternative.display())
+        );
 
         // Pure dynamic linker is not replaced is alternative is not specified
         let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
@@ -1470,7 +1499,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 
     #[test]
@@ -1501,6 +1530,6 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result, raw_link_arguments);
+        assert_eq!(result.join(" "), raw_link_arguments);
     }
 }
