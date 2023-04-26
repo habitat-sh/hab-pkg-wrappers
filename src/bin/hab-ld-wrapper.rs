@@ -654,9 +654,9 @@ fn parse_linker_arguments(
         .iter()
         .any(|(_, state)| state.result == LibraryLinkResult::NotFound);
     if let (Some(prefix), true) = (&env.prefix, is_library_missing) {
-        for library_search_path in library_search_paths.iter() {
-            if library_search_path.starts_with(prefix) {
-                filtered_arguments.push(format!("-rpath={}", library_search_path.display()));
+        for run_path in env.ld_run_path.iter() {
+            if run_path.starts_with(prefix) {
+                filtered_arguments.push(format!("-rpath={}", run_path.display()));
             }
         }
     }
@@ -1003,7 +1003,7 @@ mod tests {
         let libcrypto_shared = build_dir.join("libcrypto.so");
         touch(libcrypto_shared);
 
-        let raw_link_arguments = format!("-L{}/lib -L. -lcrypto", install_prefix_dir.display());
+        let raw_link_arguments = String::from("-L. -lcrypto");
         let link_arguments = raw_link_arguments
             .split(" ")
             .map(|x| x.to_string())
@@ -1014,6 +1014,7 @@ mod tests {
                 cwd: build_dir,
                 ..Default::default()
             },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
             prefix: Some(install_prefix_dir.clone()),
             ..Default::default()
         };
