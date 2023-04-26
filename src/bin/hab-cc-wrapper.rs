@@ -98,7 +98,8 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
         }
         if add_cxx_std_headers {
             for include_dir in env.cxx_std_headers.iter() {
-                filtered_arguments.push(format!("-isystem {}", include_dir.display()));
+                filtered_arguments.push("-isystem".to_string());
+                filtered_arguments.push(include_dir.display().to_string());
             }
         }
     }
@@ -111,7 +112,8 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
     }
     if add_c_std_headers {
         for include_dir in env.c_std_headers.iter() {
-            filtered_arguments.push(format!("-idirafter {}", include_dir.display()));
+            filtered_arguments.push("-idirafter".to_string());
+            filtered_arguments.push(include_dir.display().to_string());
         }
     }
     if env.common.is_debug {
