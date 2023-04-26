@@ -131,8 +131,8 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
 fn main() {
     let env = CCEnvironment::default();
     let mut args = std::env::args();
-    let mut executable = args.next().unwrap();
-    let mut program = args.next().expect("Wrapped program must be specified");
+    let executable = args.next().unwrap();
+    let program = args.next().expect("Wrapped program must be specified");
 
     let parsed_arguments = parse_cc_arguments(
         args.flat_map(|argument| {
@@ -153,11 +153,7 @@ fn main() {
             "original: {}",
             std::env::args().skip(1).collect::<Vec<String>>().join(" ")
         );
-        eprintln!(
-            "wrapped: {} {}",
-            program,
-            parsed_arguments.join(" ")
-        );
+        eprintln!("wrapped: {} {}", program, parsed_arguments.join(" "));
     }
 
     // Replace the current process with the new program

@@ -309,7 +309,7 @@ impl<'a> LDArgument<'a> {
             }
             (_, current_value) if current_value.is_prefixed_with("-R") => {
                 let path = current_value.strip_prefix("-R").unwrap();
-                if !PathBuf::from(current_value).is_file() {
+                if !PathBuf::from(path).is_file() {
                     Some(LDArgument::RPath(current_value, true))
                 } else {
                     None
@@ -317,7 +317,7 @@ impl<'a> LDArgument<'a> {
             }
             (_, current_value) if current_value.is_prefixed_with("-just-symbols=") => {
                 let path = current_value.strip_prefix("-just-symbols=").unwrap();
-                if !PathBuf::from(current_value).is_file() {
+                if !PathBuf::from(path).is_file() {
                     Some(LDArgument::RPath(current_value, true))
                 } else {
                     None
@@ -418,7 +418,7 @@ fn parse_linker_arguments(
                         }
                     }
                 }
-                LDArgument::LibraryName(library_name, is_prefixed) => {
+                LDArgument::LibraryName(library_name, _) => {
                     library_references.insert(
                         LibraryReference::Name(library_name.to_string()),
                         LibraryReferenceState {
@@ -427,7 +427,7 @@ fn parse_linker_arguments(
                         },
                     );
                 }
-                LDArgument::LibraryFileName(library_file_name, is_prefixed) => {
+                LDArgument::LibraryFileName(library_file_name, _) => {
                     library_references.insert(
                         LibraryReference::FileName(library_file_name.into()),
                         LibraryReferenceState {
@@ -492,7 +492,7 @@ fn parse_linker_arguments(
                         bad_plugin = false
                     }
                 }
-                LDArgument::PluginOpt(path, is_prefixed) => {
+                LDArgument::PluginOpt(_, is_prefixed) => {
                     if bad_plugin {
                         skip_argument = true;
                         skip_prev_argument = !is_prefixed;
@@ -673,8 +673,8 @@ fn parse_linker_arguments(
 fn main() {
     let env = LDEnvironment::default();
     let mut args = std::env::args();
-    let mut executable = args.next().unwrap();
-    let mut program = args.next().expect("Wrapped program must be specified");
+    let executable = args.next().unwrap();
+    let program = args.next().expect("Wrapped program must be specified");
 
     let parsed_arguments = parse_linker_arguments(
         args.flat_map(|argument| {

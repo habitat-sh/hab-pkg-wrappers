@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::{BufRead, BufReader, Read},
-    path::PathBuf,
-};
+use std::{fs::File, io::Read, path::PathBuf};
 
 use path_absolutize::Absolutize;
 
