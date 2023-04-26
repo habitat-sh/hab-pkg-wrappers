@@ -590,22 +590,29 @@ fn parse_linker_arguments(
                     let library_file_path = library_search_path.join(library_file_name);
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_state.linker_state.is_as_needed {
-                                if !rpaths.contains(&library_search_path)
-                                    && env.ld_run_path.contains(&library_search_path)
-                                {
-                                    filtered_arguments
-                                        .push(format!("-rpath={}", library_search_path.display()));
-                                    rpaths.push(library_search_path.clone());
+                            if library_search_path.is_pkg_path(env) {
+                                if library_state.linker_state.is_as_needed {
+                                    if !rpaths.contains(&library_search_path)
+                                        && env.ld_run_path.contains(&library_search_path)
+                                    {
+                                        filtered_arguments.push(format!(
+                                            "-rpath={}",
+                                            library_search_path.display()
+                                        ));
+                                        rpaths.push(library_search_path.clone());
+                                    }
+                                    library_state.result =
+                                        LibraryLinkResult::SharedLibraryLinkAsNeeded;
+                                } else {
+                                    if !rpaths.contains(library_search_path) {
+                                        filtered_arguments.push(format!(
+                                            "-rpath={}",
+                                            library_search_path.display()
+                                        ));
+                                        rpaths.push(library_search_path.clone());
+                                    }
+                                    library_state.result = LibraryLinkResult::SharedLibraryLinked;
                                 }
-                                library_state.result = LibraryLinkResult::SharedLibraryLinkAsNeeded;
-                            } else {
-                                if !rpaths.contains(library_search_path) {
-                                    filtered_arguments
-                                        .push(format!("-rpath={}", library_search_path.display()));
-                                    rpaths.push(library_search_path.clone());
-                                }
-                                library_state.result = LibraryLinkResult::SharedLibraryLinked;
                             }
                         }
                     } else if library_file_path.is_static_library() {
@@ -622,22 +629,29 @@ fn parse_linker_arguments(
                         .to_path_buf();
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_state.linker_state.is_as_needed {
-                                if !rpaths.contains(&library_search_path)
-                                    && env.ld_run_path.contains(&library_search_path)
-                                {
-                                    filtered_arguments
-                                        .push(format!("-rpath={}", library_search_path.display()));
-                                    rpaths.push(library_search_path);
+                            if library_search_path.is_pkg_path(env) {
+                                if library_state.linker_state.is_as_needed {
+                                    if !rpaths.contains(&library_search_path)
+                                        && env.ld_run_path.contains(&library_search_path)
+                                    {
+                                        filtered_arguments.push(format!(
+                                            "-rpath={}",
+                                            library_search_path.display()
+                                        ));
+                                        rpaths.push(library_search_path);
+                                    }
+                                    library_state.result =
+                                        LibraryLinkResult::SharedLibraryLinkAsNeeded;
+                                } else {
+                                    if !rpaths.contains(&library_search_path) {
+                                        filtered_arguments.push(format!(
+                                            "-rpath={}",
+                                            library_search_path.display()
+                                        ));
+                                        rpaths.push(library_search_path);
+                                    }
+                                    library_state.result = LibraryLinkResult::SharedLibraryLinked;
                                 }
-                                library_state.result = LibraryLinkResult::SharedLibraryLinkAsNeeded;
-                            } else {
-                                if !rpaths.contains(&library_search_path) {
-                                    filtered_arguments
-                                        .push(format!("-rpath={}", library_search_path.display()));
-                                    rpaths.push(library_search_path);
-                                }
-                                library_state.result = LibraryLinkResult::SharedLibraryLinked;
                             }
                         }
                     } else if library_file_path.is_static_library() {
@@ -713,8 +727,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use hab_pkg_wrappers::env::CommonEnvironment;
-    use std::fs::{self, File};
-    use std::path::{Path, PathBuf};
+    use std::fs::File;
+    use std::path::Path;
     use tempdir::TempDir;
 
     use crate::{parse_linker_arguments, LDEnvironment};
@@ -1001,9 +1015,61 @@ mod tests {
             .join("src")
             .join("openssl");
         let libcrypto_shared = build_dir.join("libcrypto.so");
-        touch(libcrypto_shared);
+        touch(&libcrypto_shared);
 
         let raw_link_arguments = String::from("-L. -lcrypto");
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                cwd: build_dir.clone(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                install_prefix_dir.join("lib").display()
+            )
+        );
+
+        // Passed as absolute path to shared library
+        let raw_link_arguments = format!("-L. {}", libcrypto_shared.display());
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                cwd: build_dir.clone(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                install_prefix_dir.join("lib").display()
+            )
+        );
+
+        // Passed as exact filename to shared library
+        let raw_link_arguments = String::from("-L. -l:libcrypto.so");
         let link_arguments = raw_link_arguments
             .split(" ")
             .map(|x| x.to_string())
@@ -1048,10 +1114,10 @@ mod tests {
             .join("cache")
             .join("src")
             .join("openssl");
-        let libcrypto_shared = build_dir.join("libcrypto.a");
-        touch(libcrypto_shared);
+        let libcrypto_static = build_dir.join("libcrypto.a");
+        touch(libcrypto_static);
 
-        let raw_link_arguments = format!("-L{}/lib -L. -lcrypto", install_prefix_dir.display());
+        let raw_link_arguments = String::from("-L. -lcrypto");
         let link_arguments = raw_link_arguments
             .split(" ")
             .map(|x| x.to_string())
