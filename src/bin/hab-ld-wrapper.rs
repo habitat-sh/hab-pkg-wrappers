@@ -133,15 +133,15 @@ enum LibraryReference {
 #[derive(Debug)]
 struct LibraryReferenceState {
     linker_state: LinkerState,
-    result: LibraryLinkResult,
+    library_name: Option<String>,
+    results: Vec<LibraryLinkResult>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum LibraryLinkResult {
     StaticLibraryLinked,
-    SharedLibraryLinked,
-    SharedLibraryLinkAsNeeded,
-    NotFound,
+    SharedLibraryLinked(PathBuf),
+    SharedLibraryLinkAsNeeded(PathBuf),
 }
 
 #[derive(Debug)]
@@ -382,6 +382,18 @@ struct LinkerState {
     is_copy_dt_needed_entries: bool,
 }
 
+fn effective_library_name(library_reference: &LibraryReference) -> Option<String> {
+    match library_reference {
+        LibraryReference::Name(library_name) => Some(library_name.to_string()),
+        LibraryReference::FileName(library_file_name)
+        | LibraryReference::FilePath(library_file_name) => library_file_name
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .and_then(|file_name| file_name.strip_prefix("lib"))
+            .and_then(|file_name| file_name.split_once("."))
+            .map(|(library_name, _)| library_name.to_string()),
+    }
+}
 fn parse_linker_arguments(
     arguments: impl Iterator<Item = String>,
     env: &LDEnvironment,
@@ -394,7 +406,9 @@ fn parse_linker_arguments(
 
     let mut library_search_paths = vec![];
     let mut rpaths: Vec<PathBuf> = vec![];
-    let mut library_references = HashMap::new();
+    let mut additional_rpaths: Vec<PathBuf> = vec![];
+    let mut library_references = Vec::new();
+    let mut libraries_linked = HashMap::new();
 
     for argument in arguments {
         let mut skip_argument = false;
@@ -419,39 +433,44 @@ fn parse_linker_arguments(
                     }
                 }
                 LDArgument::LibraryName(library_name, _) => {
-                    library_references.insert(
-                        LibraryReference::Name(library_name.to_string()),
+                    let library_reference = LibraryReference::Name(library_name.to_string());
+                    let library_name = effective_library_name(&library_reference);
+                    library_references.push((
+                        library_reference,
                         LibraryReferenceState {
                             linker_state: current_linker_state,
-                            result: LibraryLinkResult::NotFound,
+                            library_name,
+                            results: Vec::new(),
                         },
-                    );
+                    ));
                 }
                 LDArgument::LibraryFileName(library_file_name, _) => {
-                    library_references.insert(
-                        LibraryReference::FileName(library_file_name.into()),
+                    let library_reference = LibraryReference::FileName(library_file_name.into());
+                    let library_name = effective_library_name(&library_reference);
+                    library_references.push((
+                        library_reference,
                         LibraryReferenceState {
                             linker_state: current_linker_state,
-                            result: LibraryLinkResult::NotFound,
+                            library_name,
+                            results: Vec::new(),
                         },
-                    );
+                    ));
                 }
                 LDArgument::LibraryFilePath(library_file_path) => {
                     let library_file_path = library_file_path.absolute_path(env);
                     if library_file_path.is_bad_path(env) {
                         skip_argument = true;
                     } else {
-                        let rpath = library_file_path.parent().unwrap().to_path_buf();
-                        if !rpaths.contains(&rpath) {
-                            rpaths.push(rpath);
-                        }
-                        library_references.insert(
-                            LibraryReference::FilePath(library_file_path),
+                        let library_reference = LibraryReference::FilePath(library_file_path);
+                        let library_name = effective_library_name(&library_reference);
+                        library_references.push((
+                            library_reference,
                             LibraryReferenceState {
                                 linker_state: current_linker_state,
-                                result: LibraryLinkResult::NotFound,
+                                library_name,
+                                results: Vec::new(),
                             },
-                        );
+                        ));
                     }
                 }
                 LDArgument::RPath(rpath, is_prefixed) => {
@@ -467,14 +486,16 @@ fn parse_linker_arguments(
                 }
                 LDArgument::DynamicLinker(dynamic_linker_path, is_prefixed) => {
                     if let Some(env_dynamic_linker_path) = env.dynamic_linker.as_ref() {
-                        skip_argument = true;
-                        if !is_prefixed {
-                            filtered_arguments.pop();
+                        if dynamic_linker_path.is_bad_path(env) {
+                            skip_argument = true;
+                            if !is_prefixed {
+                                filtered_arguments.pop();
+                            }
+                            filtered_arguments.push(format!(
+                                "-dynamic-linker={}",
+                                env_dynamic_linker_path.display()
+                            ));
                         }
-                        filtered_arguments.push(format!(
-                            "-dynamic-linker={}",
-                            env_dynamic_linker_path.display()
-                        ));
                     } else {
                         if dynamic_linker_path.is_bad_path(env) {
                             skip_argument = true;
@@ -538,50 +559,40 @@ fn parse_linker_arguments(
     // Search for libraries in library search paths
     for library_search_path in library_search_paths.iter() {
         for (library_reference, library_state) in library_references.iter_mut() {
-            if library_state.result != LibraryLinkResult::NotFound {
-                continue;
-            }
             match library_reference {
                 LibraryReference::Name(library_name) => {
                     if library_state.linker_state.is_static {
                         let library_file_path =
                             library_search_path.join(format!("lib{}.a", library_name));
                         if library_file_path.is_file() {
-                            library_state.result = LibraryLinkResult::StaticLibraryLinked;
+                            library_state
+                                .results
+                                .push(LibraryLinkResult::StaticLibraryLinked);
                         }
                     } else {
                         let library_file_path =
                             library_search_path.join(format!("lib{}.so", library_name));
                         if library_file_path.is_file() {
-                            if library_search_path.is_pkg_path(env) {
-                                if library_state.linker_state.is_as_needed {
-                                    if !rpaths.contains(&library_search_path)
-                                        && env.ld_run_path.contains(&library_search_path)
-                                    {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path.clone());
-                                    }
-                                    library_state.result =
-                                        LibraryLinkResult::SharedLibraryLinkAsNeeded;
-                                } else {
-                                    if !rpaths.contains(&library_search_path) {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path.clone());
-                                    }
-                                    library_state.result = LibraryLinkResult::SharedLibraryLinked;
-                                }
+                            if library_state.linker_state.is_as_needed {
+                                library_state.results.push(
+                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
+                                        library_search_path.to_path_buf(),
+                                    ),
+                                );
+                            } else {
+                                library_state
+                                    .results
+                                    .push(LibraryLinkResult::SharedLibraryLinked(
+                                        library_search_path.to_path_buf(),
+                                    ));
                             }
                         } else {
                             let library_file_path =
                                 library_search_path.join(format!("lib{}.a", library_name));
                             if library_file_path.is_file() {
-                                library_state.result = LibraryLinkResult::StaticLibraryLinked;
+                                library_state
+                                    .results
+                                    .push(LibraryLinkResult::StaticLibraryLinked);
                             }
                         }
                     }
@@ -590,38 +601,33 @@ fn parse_linker_arguments(
                     let library_file_path = library_search_path.join(library_file_name);
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_search_path.is_pkg_path(env) {
-                                if library_state.linker_state.is_as_needed {
-                                    if !rpaths.contains(&library_search_path)
-                                        && env.ld_run_path.contains(&library_search_path)
-                                    {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path.clone());
-                                    }
-                                    library_state.result =
-                                        LibraryLinkResult::SharedLibraryLinkAsNeeded;
-                                } else {
-                                    if !rpaths.contains(library_search_path) {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path.clone());
-                                    }
-                                    library_state.result = LibraryLinkResult::SharedLibraryLinked;
-                                }
+                            if library_state.linker_state.is_as_needed {
+                                library_state.results.push(
+                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
+                                        library_search_path.to_path_buf(),
+                                    ),
+                                );
+                            } else {
+                                library_state
+                                    .results
+                                    .push(LibraryLinkResult::SharedLibraryLinked(
+                                        library_search_path.to_path_buf(),
+                                    ));
                             }
                         }
                     } else if library_file_path.is_static_library() {
                         if library_file_path.is_file() {
-                            library_state.result = LibraryLinkResult::StaticLibraryLinked;
+                            library_state
+                                .results
+                                .push(LibraryLinkResult::StaticLibraryLinked);
                         }
                     }
                 }
                 LibraryReference::FilePath(library_file_path) => {
+                    // File's can only be found once irrespective of search path
+                    if !library_state.results.is_empty() {
+                        continue;
+                    }
                     let library_search_path: PathBuf = library_file_path
                         .absolute_path(env)
                         .parent()
@@ -629,56 +635,102 @@ fn parse_linker_arguments(
                         .to_path_buf();
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_search_path.is_pkg_path(env) {
-                                if library_state.linker_state.is_as_needed {
-                                    if !rpaths.contains(&library_search_path)
-                                        && env.ld_run_path.contains(&library_search_path)
-                                    {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path);
-                                    }
-                                    library_state.result =
-                                        LibraryLinkResult::SharedLibraryLinkAsNeeded;
-                                } else {
-                                    if !rpaths.contains(&library_search_path) {
-                                        filtered_arguments.push(format!(
-                                            "-rpath={}",
-                                            library_search_path.display()
-                                        ));
-                                        rpaths.push(library_search_path);
-                                    }
-                                    library_state.result = LibraryLinkResult::SharedLibraryLinked;
-                                }
+                            if library_state.linker_state.is_as_needed {
+                                library_state.results.push(
+                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
+                                        library_search_path.to_path_buf(),
+                                    ),
+                                );
+                            } else {
+                                library_state
+                                    .results
+                                    .push(LibraryLinkResult::SharedLibraryLinked(
+                                        library_search_path.to_path_buf(),
+                                    ));
                             }
                         }
                     } else if library_file_path.is_static_library() {
                         if library_file_path.is_file() {
-                            library_state.result = LibraryLinkResult::StaticLibraryLinked;
+                            library_state
+                                .results
+                                .push(LibraryLinkResult::StaticLibraryLinked);
                         }
                     }
                 }
             }
         }
     }
+    let mut all_libraries_will_link = true;
+    for (library_reference, library_state) in library_references.iter() {
+        let mut library_will_link = false;
+        if let Some(library_name) = library_state.library_name.as_ref() {
+            if libraries_linked.contains_key(library_name) {
+                continue;
+            }
+            let mut final_link_result = None;
+            for result in library_state.results.iter() {
+                match result {
+                    LibraryLinkResult::StaticLibraryLinked => {
+                        library_will_link = true;
+                    }
+                    LibraryLinkResult::SharedLibraryLinked(library_search_path) => {
+                        if library_search_path.is_pkg_path(env) {
+                            if !rpaths.contains(&library_search_path)
+                                && !additional_rpaths.contains(&library_search_path)
+                            {
+                                additional_rpaths.push(library_search_path.clone())
+                            }
+                            library_will_link = true;
+                        }
+                    }
+                    LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
+                        if library_search_path.is_pkg_path(env)
+                            && env.ld_run_path.contains(&library_search_path)
+                        {
+                            if !rpaths.contains(&library_search_path)
+                                && !additional_rpaths.contains(&library_search_path)
+                            {
+                                additional_rpaths.push(library_search_path.clone())
+                            }
+                            library_will_link = true;
+                        }
+                    }
+                }
+                if library_will_link {
+                    final_link_result = Some(result.clone());
+                    break;
+                }
+            }
+            if !library_will_link {
+                all_libraries_will_link = false;
+            }
+            libraries_linked.insert(library_name, (library_reference, final_link_result));
+        }
+    }
 
-    let is_library_missing = library_references
-        .iter()
-        .any(|(_, state)| state.result == LibraryLinkResult::NotFound);
-    if let (Some(prefix), true) = (&env.prefix, is_library_missing) {
-        for run_path in env.ld_run_path.iter() {
-            if run_path.starts_with(prefix) {
-                filtered_arguments.push(format!("-rpath={}", run_path.display()));
+    if !all_libraries_will_link {
+        if let Some(prefix) = env.prefix.as_ref() {
+            for run_path in env.ld_run_path.iter() {
+                if run_path.starts_with(prefix) {
+                    if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path) {
+                        additional_rpaths.push(run_path.clone())
+                    }
+                }
             }
         }
+    }
+
+    for additional_rpath in additional_rpaths.iter() {
+        filtered_arguments.push(format!("-rpath={}", additional_rpath.display()));
     }
 
     if env.common.is_debug {
         eprintln!("library_search_paths: {:#?}", library_search_paths);
         eprintln!("library_references: {:#?}", library_references);
         eprintln!("rpaths: {:#?}", rpaths);
+        eprintln!("additional_rpaths: {:#?}", additional_rpaths);
+        eprintln!("libraries_linked: {:#?}", libraries_linked);
+        eprintln!("all_libraries_will_link: {}", all_libraries_will_link);
         eprintln!("filtered_ld_arguments: {:#?}", filtered_arguments);
     }
     filtered_arguments
@@ -1017,6 +1069,7 @@ mod tests {
         let libcrypto_shared = build_dir.join("libcrypto.so");
         touch(&libcrypto_shared);
 
+        // Passed as -l flag
         let raw_link_arguments = String::from("-L. -lcrypto");
         let link_arguments = raw_link_arguments
             .split(" ")
@@ -1078,6 +1131,132 @@ mod tests {
             common: CommonEnvironment {
                 fs_root: temp_dir.path().to_path_buf(),
                 cwd: build_dir,
+                ..Default::default()
+            },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                install_prefix_dir.join("lib").display()
+            )
+        );
+    }
+
+    // This is the case when a binary/library links dynamically against both the old and newly built version of a library
+    // in the same package, this happens most importantly in glibc
+    // An rpath entry to the install path is added to ensure the library is found at runtime
+    #[test]
+    fn link_against_newer_version_of_same_shared_library_in_build_package() {
+        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+        let old_install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("glibc")
+            .join("old-version")
+            .join("release");
+        let old_libc_shared = old_install_prefix_dir.join("libc.so");
+        touch(&old_libc_shared);
+
+        let install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("glibc")
+            .join("version")
+            .join("release");
+        let build_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("cache")
+            .join("src")
+            .join("glibc");
+        let new_libc_shared = build_dir.join("libc.so");
+        touch(&new_libc_shared);
+
+        // New library passed via build search path
+        let raw_link_arguments = format!(
+            "-L{} -L{} {} -lc",
+            build_dir.display(),
+            old_install_prefix_dir.display(),
+            new_libc_shared.display()
+        );
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                cwd: build_dir.clone(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                install_prefix_dir.join("lib").display()
+            )
+        );
+
+        // New library passed as absolute path
+        let raw_link_arguments = format!(
+            "-L{} {} -lc",
+            old_install_prefix_dir.display(),
+            new_libc_shared.display()
+        );
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                cwd: build_dir.clone(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_prefix_dir.join("lib")],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                install_prefix_dir.join("lib").display()
+            )
+        );
+
+        let new_libc_shared = build_dir.join("libc.so.new");
+        touch(&new_libc_shared);
+
+        // New library passed as exact file name
+        let raw_link_arguments =
+            format!("-L{} -l:libc.so.new -lc", old_install_prefix_dir.display(),);
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                cwd: build_dir.clone(),
                 ..Default::default()
             },
             ld_run_path: vec![install_prefix_dir.join("lib")],
@@ -1417,7 +1596,7 @@ mod tests {
         assert_eq!(
             result.join(" "),
             format!(
-                "-L {} -lc {}",
+                "-L {} -lc {} -rpath={0}",
                 libc_search_path.display(),
                 libc_shared.display()
             )
@@ -1532,7 +1711,7 @@ mod tests {
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(result.join(" "), String::from(""));
 
-        // Pure dynamic linker is replaced by specified linker
+        // Pure dynamic linker is not replaced by specified linker
         let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
         let link_arguments = raw_link_arguments
             .split(" ")
@@ -1547,10 +1726,7 @@ mod tests {
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!("-dynamic-linker={}", dynamic_linker_alternative.display())
-        );
+        assert_eq!(result.join(" "), raw_link_arguments);
 
         // Pure dynamic linker is not replaced is alternative is not specified
         let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
