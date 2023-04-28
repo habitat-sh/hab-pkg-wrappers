@@ -139,7 +139,7 @@ struct LibraryReferenceState {
 
 #[derive(Debug, PartialEq, Eq)]
 enum LibraryLinkResult {
-    StaticLibraryLinked,
+    StaticLibraryLinked(PathBuf),
     SharedLibraryLinked(PathBuf),
     SharedLibraryLinkAsNeeded(PathBuf),
 }
@@ -567,7 +567,7 @@ fn parse_linker_arguments(
                         if library_file_path.is_file() {
                             library_state
                                 .results
-                                .push(LibraryLinkResult::StaticLibraryLinked);
+                                .push(LibraryLinkResult::StaticLibraryLinked(library_file_path));
                         }
                     } else {
                         let library_file_path =
@@ -592,7 +592,9 @@ fn parse_linker_arguments(
                             if library_file_path.is_file() {
                                 library_state
                                     .results
-                                    .push(LibraryLinkResult::StaticLibraryLinked);
+                                    .push(LibraryLinkResult::StaticLibraryLinked(
+                                        library_file_path,
+                                    ));
                             }
                         }
                     }
@@ -619,7 +621,7 @@ fn parse_linker_arguments(
                         if library_file_path.is_file() {
                             library_state
                                 .results
-                                .push(LibraryLinkResult::StaticLibraryLinked);
+                                .push(LibraryLinkResult::StaticLibraryLinked(library_file_path));
                         }
                     }
                 }
@@ -653,16 +655,19 @@ fn parse_linker_arguments(
                         if library_file_path.is_file() {
                             library_state
                                 .results
-                                .push(LibraryLinkResult::StaticLibraryLinked);
+                                .push(LibraryLinkResult::StaticLibraryLinked(
+                                    library_file_path.to_path_buf(),
+                                ));
                         }
                     }
                 }
             }
         }
     }
-    let mut all_libraries_will_link = true;
+    let mut all_needed_libraries_will_link = true;
     for (library_reference, library_state) in library_references.iter() {
         let mut library_will_link = false;
+        let mut library_is_needed = true;
         if let Some(library_name) = library_state.library_name.as_ref() {
             if libraries_linked.contains_key(library_name) {
                 continue;
@@ -670,7 +675,7 @@ fn parse_linker_arguments(
             let mut final_link_result = None;
             for result in library_state.results.iter() {
                 match result {
-                    LibraryLinkResult::StaticLibraryLinked => {
+                    LibraryLinkResult::StaticLibraryLinked(_) => {
                         library_will_link = true;
                     }
                     LibraryLinkResult::SharedLibraryLinked(library_search_path) => {
@@ -684,31 +689,33 @@ fn parse_linker_arguments(
                         }
                     }
                     LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
-                        if library_search_path.is_pkg_path(env)
-                            && env.ld_run_path.contains(&library_search_path)
-                        {
-                            if !rpaths.contains(&library_search_path)
-                                && !additional_rpaths.contains(&library_search_path)
-                            {
-                                additional_rpaths.push(library_search_path.clone())
+                        if library_search_path.is_pkg_path(env) {
+                            if env.ld_run_path.contains(&library_search_path) {
+                                if !rpaths.contains(&library_search_path)
+                                    && !additional_rpaths.contains(&library_search_path)
+                                {
+                                    additional_rpaths.push(library_search_path.clone())
+                                }
+                                library_will_link = true;
+                            } else {
+                                library_is_needed = false;
                             }
-                            library_will_link = true;
                         }
                     }
                 }
-                if library_will_link {
+                if library_will_link && library_is_needed {
                     final_link_result = Some(result.clone());
                     break;
                 }
             }
-            if !library_will_link {
-                all_libraries_will_link = false;
+            if !library_will_link && library_is_needed {
+                all_needed_libraries_will_link = false;
             }
             libraries_linked.insert(library_name, (library_reference, final_link_result));
         }
     }
 
-    if !all_libraries_will_link {
+    if !all_needed_libraries_will_link {
         if let Some(prefix) = env.prefix.as_ref() {
             for run_path in env.ld_run_path.iter() {
                 if run_path.starts_with(prefix) {
@@ -730,7 +737,10 @@ fn parse_linker_arguments(
         eprintln!("rpaths: {:#?}", rpaths);
         eprintln!("additional_rpaths: {:#?}", additional_rpaths);
         eprintln!("libraries_linked: {:#?}", libraries_linked);
-        eprintln!("all_libraries_will_link: {}", all_libraries_will_link);
+        eprintln!(
+            "all_needed_libraries_will_link: {}",
+            all_needed_libraries_will_link
+        );
         eprintln!("filtered_ld_arguments: {:#?}", filtered_arguments);
     }
     filtered_arguments
@@ -1317,6 +1327,15 @@ mod tests {
     #[test]
     fn link_as_needed_without_ld_run_path_hint() {
         let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+        let install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("openssl")
+            .join("version")
+            .join("release");
+        let install_lib_dir = install_prefix_dir.join("lib");
         let libc_search_path = temp_dir
             .path()
             .join("hab")
@@ -1341,6 +1360,8 @@ mod tests {
                 fs_root: temp_dir.path().to_path_buf(),
                 ..Default::default()
             },
+            ld_run_path: vec![install_lib_dir],
+            prefix: Some(install_prefix_dir.clone()),
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1350,6 +1371,15 @@ mod tests {
     #[test]
     fn link_as_needed_with_ld_run_path_hint() {
         let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+        let install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("openssl")
+            .join("version")
+            .join("release");
+        let install_lib_dir = install_prefix_dir.join("lib");
         let libc_search_path = temp_dir
             .path()
             .join("hab")
@@ -1374,7 +1404,8 @@ mod tests {
                 fs_root: temp_dir.path().to_path_buf(),
                 ..Default::default()
             },
-            ld_run_path: vec![libc_search_path.clone()],
+            prefix: Some(install_prefix_dir.clone()),
+            ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1391,6 +1422,15 @@ mod tests {
     #[test]
     fn push_state_as_needed_linking() {
         let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+        let install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("openssl")
+            .join("version")
+            .join("release");
+        let install_lib_dir = install_prefix_dir.join("lib");
         let libc_search_path = temp_dir
             .path()
             .join("hab")
@@ -1429,6 +1469,8 @@ mod tests {
                 fs_root: temp_dir.path().to_path_buf(),
                 ..Default::default()
             },
+            prefix: Some(install_prefix_dir.clone()),
+            ld_run_path: vec![install_lib_dir.clone()],
             ..Default::default()
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
