@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     hash::Hash,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -732,16 +733,60 @@ fn parse_linker_arguments(
     }
 
     if env.common.is_debug {
-        eprintln!("library_search_paths: {:#?}", library_search_paths);
-        eprintln!("library_references: {:#?}", library_references);
-        eprintln!("rpaths: {:#?}", rpaths);
-        eprintln!("additional_rpaths: {:#?}", additional_rpaths);
-        eprintln!("libraries_linked: {:#?}", libraries_linked);
-        eprintln!(
-            "all_needed_libraries_will_link: {}",
-            all_needed_libraries_will_link
-        );
-        eprintln!("filtered_ld_arguments: {:#?}", filtered_arguments);
+        if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(debug_log_file)
+                .expect("Failed to open debug output log file");
+            write!(
+                &mut file,
+                "library_search_paths: {:#?}\n",
+                library_search_paths
+            )
+            .unwrap();
+            write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
+            write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
+            write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
+            write!(&mut file, "libraries_linked: {:#?}\n", libraries_linked).unwrap();
+            write!(
+                &mut file,
+                "all_needed_libraries_will_link: {}\n",
+                all_needed_libraries_will_link
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "filtered_ld_arguments: {:#?}\n",
+                filtered_arguments
+            )
+            .unwrap();
+        } else {
+            let mut file = std::io::stderr().lock();
+            write!(
+                &mut file,
+                "library_search_paths: {:#?}\n",
+                library_search_paths
+            )
+            .unwrap();
+            write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
+            write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
+            write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
+            write!(&mut file, "libraries_linked: {:#?}\n", libraries_linked).unwrap();
+            write!(
+                &mut file,
+                "all_needed_libraries_will_link: {}\n",
+                all_needed_libraries_will_link
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "filtered_ld_arguments: {:#?}\n",
+                filtered_arguments
+            )
+            .unwrap();
+        };
     }
     filtered_arguments
 }
@@ -771,11 +816,54 @@ fn main() {
     command.args(&parsed_arguments);
 
     if env.common.is_debug {
-        eprintln!(
-            "original: {}",
-            std::env::args().skip(1).collect::<Vec<String>>().join(" ")
-        );
-        eprintln!("wrapped: {} {}", program, parsed_arguments.join(" "));
+        if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(debug_log_file)
+                .expect("Failed to open debug output log file");
+            write!(
+                &mut file,
+                "work_dir: {}\n",
+                std::env::current_dir().unwrap().display()
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "original: {}\n",
+                std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "wrapped: {} {}\n",
+                program,
+                parsed_arguments.join(" ")
+            )
+            .unwrap();
+        } else {
+            let mut file = std::io::stderr().lock();
+            write!(
+                &mut file,
+                "work_dir: {}\n",
+                std::env::current_dir().unwrap().display()
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "original: {}\n",
+                std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "wrapped: {} {}\n",
+                program,
+                parsed_arguments.join(" ")
+            )
+            .unwrap();
+        };
     }
 
     // Replace the current process with the new program

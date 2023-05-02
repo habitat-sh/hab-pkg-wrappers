@@ -20,6 +20,7 @@ An argument processor for parsing and managing arguments passed to the system li
 | Variable | Description |
 |----------|-------------|
 | HAB_DEBUG | Outputs debug information to stderr for debugging purposes |
+| HAB_DEBUG_LOG_FILE | Writes debug information to specified file instead of stderr. This prevents it from breaking certain autoconf checks |
 | HAB_DYNAMIC_LINKER | Specifies the dynamic linker to use when creating executables with shared libraries |
 | HAB_LD_RUN_PATH | A list of directories containing runtime libraries, separated by ':'; also serves as a hint for including rpath entries for `--as-needed` libraries |
 | HAB_ENFORCE_PURITY | Filters out all impure paths passed to the linker when set to '1' |
@@ -39,6 +40,8 @@ An argument processor for parsing and managing arguments passed to the C compile
 
 | Variable | Description |
 |-|-|
+| HAB_DEBUG | Outputs debug information to stderr for debugging purposes |
+| HAB_DEBUG_LOG_FILE | Writes debug information to specified file instead of stderr. This prevents it from breaking certain autoconf checks |
 | HAB_CC_EXECUTABLE_NAME | Specifies the name of the binary being wrapped; used to determine if a C or C++ compiler is in use |
 | HAB_LD_BIN | Indicates the path to the desired linker binary |
 | HAB_C_START_FILES	| Specifies the path to C start files |

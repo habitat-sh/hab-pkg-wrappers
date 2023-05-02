@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
@@ -117,13 +117,40 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
         }
     }
     if env.common.is_debug {
-        eprintln!("is_cxx: {}", is_cxx);
-        eprintln!("add_start_files: {}", add_start_files);
-        eprintln!("add_c_std_libs: {}", add_c_std_libs);
-        eprintln!("add_c_std_headers: {}", add_c_std_headers);
-        eprintln!("add_cxx_std_libs: {}", add_cxx_std_libs);
-        eprintln!("add_cxx_std_headers: {}", add_cxx_std_headers);
-        eprintln!("filtered_cc_arguments: {:#?}", filtered_arguments);
+        if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(debug_log_file)
+                .expect("Failed to open debug output log file");
+            write!(&mut file, "is_cxx: {}\n", is_cxx).unwrap();
+            write!(&mut file, "add_start_files: {}\n", add_start_files).unwrap();
+            write!(&mut file, "add_c_std_libs: {}\n", add_c_std_libs).unwrap();
+            write!(&mut file, "add_c_std_headers: {}\n", add_c_std_headers).unwrap();
+            write!(&mut file, "add_cxx_std_libs: {}\n", add_cxx_std_libs).unwrap();
+            write!(&mut file, "add_cxx_std_headers: {}\n", add_cxx_std_headers).unwrap();
+            write!(
+                &mut file,
+                "filtered_cc_arguments: {:#?}\n",
+                filtered_arguments
+            )
+            .unwrap();
+        } else {
+            let mut file = std::io::stderr().lock();
+            write!(&mut file, "is_cxx: {}\n", is_cxx).unwrap();
+            write!(&mut file, "add_start_files: {}\n", add_start_files).unwrap();
+            write!(&mut file, "add_c_std_libs: {}\n", add_c_std_libs).unwrap();
+            write!(&mut file, "add_c_std_headers: {}\n", add_c_std_headers).unwrap();
+            write!(&mut file, "add_cxx_std_libs: {}\n", add_cxx_std_libs).unwrap();
+            write!(&mut file, "add_cxx_std_headers: {}\n", add_cxx_std_headers).unwrap();
+            write!(
+                &mut file,
+                "filtered_cc_arguments: {:#?}\n",
+                filtered_arguments
+            )
+            .unwrap();
+        };
     }
     filtered_arguments
 }
@@ -149,11 +176,54 @@ fn main() {
     let mut command = Command::new(&program);
     command.args(&parsed_arguments);
     if env.common.is_debug {
-        eprintln!(
-            "original: {}",
-            std::env::args().skip(1).collect::<Vec<String>>().join(" ")
-        );
-        eprintln!("wrapped: {} {}", program, parsed_arguments.join(" "));
+        if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(debug_log_file)
+                .expect("Failed to open debug output log file");
+            write!(
+                &mut file,
+                "work_dir: {} \n",
+                std::env::current_dir().unwrap().display()
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "original: {}\n",
+                std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "wrapped: {} {}\n",
+                program,
+                parsed_arguments.join(" ")
+            )
+            .unwrap();
+        } else {
+            let mut file = std::io::stderr().lock();
+            write!(
+                &mut file,
+                "work_dir: {} \n",
+                std::env::current_dir().unwrap().display()
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "original: {}\n",
+                std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+            )
+            .unwrap();
+            write!(
+                &mut file,
+                "wrapped: {} {}\n",
+                program,
+                parsed_arguments.join(" ")
+            )
+            .unwrap();
+        };
     }
 
     // Replace the current process with the new program
