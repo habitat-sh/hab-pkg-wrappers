@@ -669,6 +669,7 @@ fn parse_linker_arguments(
     for (library_reference, library_state) in library_references.iter() {
         let mut library_will_link = false;
         let mut library_is_needed = true;
+        let mut library_is_available_at_runtime = false;
         if let Some(library_name) = library_state.library_name.as_ref() {
             if libraries_linked.contains_key(library_name) {
                 continue;
@@ -681,10 +682,8 @@ fn parse_linker_arguments(
                     }
                     LibraryLinkResult::SharedLibraryLinked(library_search_path) => {
                         if library_search_path.is_pkg_path(env) {
-                            if !rpaths.contains(&library_search_path)
-                                && !additional_rpaths.contains(&library_search_path)
-                            {
-                                additional_rpaths.push(library_search_path.clone())
+                            if env.ld_run_path.contains(&library_search_path) {
+                                library_is_available_at_runtime = true;
                             }
                             library_will_link = true;
                         }
@@ -692,11 +691,7 @@ fn parse_linker_arguments(
                     LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
                         if library_search_path.is_pkg_path(env) {
                             if env.ld_run_path.contains(&library_search_path) {
-                                if !rpaths.contains(&library_search_path)
-                                    && !additional_rpaths.contains(&library_search_path)
-                                {
-                                    additional_rpaths.push(library_search_path.clone())
-                                }
+                                library_is_available_at_runtime = true;
                                 library_will_link = true;
                             } else {
                                 library_is_needed = false;
@@ -705,12 +700,31 @@ fn parse_linker_arguments(
                     }
                 }
                 if library_will_link && library_is_needed {
-                    final_link_result = Some(result.clone());
-                    break;
+                    if final_link_result.is_none() {
+                        final_link_result = Some(result.clone());
+                    } else if library_is_available_at_runtime {
+                        final_link_result = Some(result.clone());
+                    }
+                    if library_is_available_at_runtime {
+                        break;
+                    }
                 }
             }
             if !library_will_link && library_is_needed {
                 all_needed_libraries_will_link = false;
+            }
+            if let Some(result) = final_link_result {
+                match result {
+                    LibraryLinkResult::StaticLibraryLinked(_) => {}
+                    LibraryLinkResult::SharedLibraryLinked(library_search_path)
+                    | LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
+                        if !rpaths.contains(&library_search_path)
+                            && !additional_rpaths.contains(&library_search_path)
+                        {
+                            additional_rpaths.push(library_search_path.clone())
+                        }
+                    }
+                }
             }
             libraries_linked.insert(library_name, (library_reference, final_link_result));
         }
@@ -740,6 +754,8 @@ fn parse_linker_arguments(
                 .create(true)
                 .open(debug_log_file)
                 .expect("Failed to open debug output log file");
+            write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
+            write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -764,6 +780,8 @@ fn parse_linker_arguments(
             .unwrap();
         } else {
             let mut file = std::io::stderr().lock();
+            write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
+            write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -1410,6 +1428,99 @@ mod tests {
         };
         let result = parse_linker_arguments(link_arguments.into_iter(), &env);
         assert_eq!(result.join(" "), raw_link_arguments);
+    }
+
+    #[test]
+    fn link_against_same_library_in_build_and_runtime_dep() {
+        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+        let install_prefix_dir = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("openssl")
+            .join("version")
+            .join("release");
+        let install_lib_dir = install_prefix_dir.join("lib");
+        let libstdcxx_search_path = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("gcc")
+            .join("version")
+            .join("release")
+            .join("lib");
+        let libstdcxx_shared = libstdcxx_search_path.join("libstdc++.so");
+        touch(&libstdcxx_shared);
+        let libstdcxx_libs_search_path = temp_dir
+            .path()
+            .join("hab")
+            .join("pkgs")
+            .join("core")
+            .join("gcc-libs")
+            .join("version")
+            .join("release")
+            .join("lib");
+        let libstdcxx_libs_shared = libstdcxx_libs_search_path.join("libstdc++.so");
+        touch(&libstdcxx_libs_shared);
+
+        // This is the case where gcc and gcc-libs are only a build dep
+        let raw_link_arguments = format!(
+            "-L{} -L{} -lstdc++",
+            libstdcxx_search_path.display(),
+            libstdcxx_libs_search_path.display()
+        );
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                libstdcxx_search_path.display()
+            )
+        );
+
+        // This is the case where gcc is a build dep gcc-libs is a runtime dep
+        let raw_link_arguments = format!(
+            "-L{} -L{} -lstdc++",
+            libstdcxx_search_path.display(),
+            libstdcxx_libs_search_path.display()
+        );
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                libstdcxx_libs_search_path.display()
+            )
+        );
     }
 
     #[test]
