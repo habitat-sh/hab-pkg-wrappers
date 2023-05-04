@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     hash::Hash,
     io::Write,
     path::{Path, PathBuf},
@@ -124,7 +123,7 @@ where
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum LibraryReference {
     Name(String),
     FileName(PathBuf),
@@ -138,11 +137,26 @@ struct LibraryReferenceState {
     results: Vec<LibraryLinkResult>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum LibraryLinkResult {
-    StaticLibraryLinked(PathBuf),
-    SharedLibraryLinked(PathBuf),
-    SharedLibraryLinkAsNeeded(PathBuf),
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum LibraryLinkType {
+    StaticLibraryLinked,
+    SharedLibraryLinked,
+    SharedLibraryLinkAsNeeded,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct LibraryLinkResult {
+    link_type: LibraryLinkType,
+    library_file: PathBuf,
+    library_dir: PathBuf,
+    is_pkg_path: bool,
+    is_available_at_runtime: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct LibraryLinkState {
+    library_reference: LibraryReference,
+    link_result: Option<LibraryLinkResult>,
 }
 
 #[derive(Debug)]
@@ -409,7 +423,7 @@ fn parse_linker_arguments(
     let mut rpaths: Vec<PathBuf> = vec![];
     let mut additional_rpaths: Vec<PathBuf> = vec![];
     let mut library_references = Vec::new();
-    let mut libraries_linked = HashMap::new();
+    let mut libraries_linked = Vec::new();
 
     for argument in arguments {
         let mut skip_argument = false;
@@ -566,36 +580,42 @@ fn parse_linker_arguments(
                         let library_file_path =
                             library_search_path.join(format!("lib{}.a", library_name));
                         if library_file_path.is_file() {
-                            library_state
-                                .results
-                                .push(LibraryLinkResult::StaticLibraryLinked(library_file_path));
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: LibraryLinkType::StaticLibraryLinked,
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: false,
+                            });
                         }
                     } else {
                         let library_file_path =
                             library_search_path.join(format!("lib{}.so", library_name));
                         if library_file_path.is_file() {
-                            if library_state.linker_state.is_as_needed {
-                                library_state.results.push(
-                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
-                                        library_search_path.to_path_buf(),
-                                    ),
-                                );
-                            } else {
-                                library_state
-                                    .results
-                                    .push(LibraryLinkResult::SharedLibraryLinked(
-                                        library_search_path.to_path_buf(),
-                                    ));
-                            }
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: if library_state.linker_state.is_as_needed {
+                                    LibraryLinkType::SharedLibraryLinkAsNeeded
+                                } else {
+                                    LibraryLinkType::SharedLibraryLinked
+                                },
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: env
+                                    .ld_run_path
+                                    .contains(&library_search_path),
+                            });
                         } else {
                             let library_file_path =
                                 library_search_path.join(format!("lib{}.a", library_name));
                             if library_file_path.is_file() {
-                                library_state
-                                    .results
-                                    .push(LibraryLinkResult::StaticLibraryLinked(
-                                        library_file_path,
-                                    ));
+                                library_state.results.push(LibraryLinkResult {
+                                    link_type: LibraryLinkType::StaticLibraryLinked,
+                                    library_file: library_file_path.clone(),
+                                    library_dir: library_search_path.clone(),
+                                    is_pkg_path: library_file_path.is_pkg_path(env),
+                                    is_available_at_runtime: false,
+                                });
                             }
                         }
                     }
@@ -604,25 +624,29 @@ fn parse_linker_arguments(
                     let library_file_path = library_search_path.join(library_file_name);
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_state.linker_state.is_as_needed {
-                                library_state.results.push(
-                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
-                                        library_search_path.to_path_buf(),
-                                    ),
-                                );
-                            } else {
-                                library_state
-                                    .results
-                                    .push(LibraryLinkResult::SharedLibraryLinked(
-                                        library_search_path.to_path_buf(),
-                                    ));
-                            }
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: if library_state.linker_state.is_as_needed {
+                                    LibraryLinkType::SharedLibraryLinkAsNeeded
+                                } else {
+                                    LibraryLinkType::SharedLibraryLinked
+                                },
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: env
+                                    .ld_run_path
+                                    .contains(&library_search_path),
+                            });
                         }
                     } else if library_file_path.is_static_library() {
                         if library_file_path.is_file() {
-                            library_state
-                                .results
-                                .push(LibraryLinkResult::StaticLibraryLinked(library_file_path));
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: LibraryLinkType::StaticLibraryLinked,
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: false,
+                            });
                         }
                     }
                 }
@@ -638,27 +662,29 @@ fn parse_linker_arguments(
                         .to_path_buf();
                     if library_file_path.is_shared_library() {
                         if library_file_path.is_file() {
-                            if library_state.linker_state.is_as_needed {
-                                library_state.results.push(
-                                    LibraryLinkResult::SharedLibraryLinkAsNeeded(
-                                        library_search_path.to_path_buf(),
-                                    ),
-                                );
-                            } else {
-                                library_state
-                                    .results
-                                    .push(LibraryLinkResult::SharedLibraryLinked(
-                                        library_search_path.to_path_buf(),
-                                    ));
-                            }
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: if library_state.linker_state.is_as_needed {
+                                    LibraryLinkType::SharedLibraryLinkAsNeeded
+                                } else {
+                                    LibraryLinkType::SharedLibraryLinked
+                                },
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: env
+                                    .ld_run_path
+                                    .contains(&library_search_path),
+                            });
                         }
                     } else if library_file_path.is_static_library() {
                         if library_file_path.is_file() {
-                            library_state
-                                .results
-                                .push(LibraryLinkResult::StaticLibraryLinked(
-                                    library_file_path.to_path_buf(),
-                                ));
+                            library_state.results.push(LibraryLinkResult {
+                                link_type: LibraryLinkType::StaticLibraryLinked,
+                                library_file: library_file_path.clone(),
+                                library_dir: library_search_path.clone(),
+                                is_pkg_path: library_file_path.is_pkg_path(env),
+                                is_available_at_runtime: false,
+                            });
                         }
                     }
                 }
@@ -666,67 +692,112 @@ fn parse_linker_arguments(
         }
     }
     let mut all_needed_libraries_will_link = true;
+    // We go through the search results for each library reference
     for (library_reference, library_state) in library_references.iter() {
         let mut library_will_link = false;
         let mut library_is_needed = true;
         let mut library_is_available_at_runtime = false;
         if let Some(library_name) = library_state.library_name.as_ref() {
-            if libraries_linked.contains_key(library_name) {
-                continue;
+            let mut library_index = 0;
+            if let Some(LibraryLinkState { link_result, .. }) =
+                libraries_linked.iter().find_map(|(name, link_state)| {
+                    library_index += 1;
+                    if name == library_name {
+                        Some(link_state)
+                    } else {
+                        None
+                    }
+                })
+            {
+                match link_result {
+                    Some(link_result) => match link_result.link_type {
+                        LibraryLinkType::StaticLibraryLinked => continue,
+                        LibraryLinkType::SharedLibraryLinked
+                        | LibraryLinkType::SharedLibraryLinkAsNeeded => {
+                            // We have already found a folder available at runtime with the library
+                            if link_result.is_available_at_runtime {
+                                continue;
+                            }
+                        }
+                    },
+                    None => {
+                        continue;
+                    }
+                }
+            } else {
+                library_index = 0;
             }
+
             let mut final_link_result = None;
             for result in library_state.results.iter() {
-                match result {
-                    LibraryLinkResult::StaticLibraryLinked(_) => {
+                match result.link_type {
+                    LibraryLinkType::StaticLibraryLinked => {
                         library_will_link = true;
                     }
-                    LibraryLinkResult::SharedLibraryLinked(library_search_path) => {
-                        if library_search_path.is_pkg_path(env) {
-                            if env.ld_run_path.contains(&library_search_path) {
-                                library_is_available_at_runtime = true;
-                            }
+                    LibraryLinkType::SharedLibraryLinked => {
+                        if result.is_pkg_path {
                             library_will_link = true;
                         }
+                        library_is_available_at_runtime = result.is_available_at_runtime;
                     }
-                    LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
-                        if library_search_path.is_pkg_path(env) {
-                            if env.ld_run_path.contains(&library_search_path) {
-                                library_is_available_at_runtime = true;
+                    LibraryLinkType::SharedLibraryLinkAsNeeded => {
+                        if result.is_pkg_path {
+                            if result.is_available_at_runtime {
                                 library_will_link = true;
                             } else {
                                 library_is_needed = false;
                             }
                         }
+                        library_is_available_at_runtime = result.is_available_at_runtime;
                     }
                 }
+
                 if library_will_link && library_is_needed {
                     if final_link_result.is_none() {
                         final_link_result = Some(result.clone());
                     } else if library_is_available_at_runtime {
                         final_link_result = Some(result.clone());
                     }
+                    // If the library is needed and available at runtime no need
+                    // to examine further results
                     if library_is_available_at_runtime {
                         break;
                     }
                 }
             }
+            // This indicates that there is a dependency on a library that is built in
+            // the same package
             if !library_will_link && library_is_needed {
                 all_needed_libraries_will_link = false;
             }
-            if let Some(result) = final_link_result {
-                match result {
-                    LibraryLinkResult::StaticLibraryLinked(_) => {}
-                    LibraryLinkResult::SharedLibraryLinked(library_search_path)
-                    | LibraryLinkResult::SharedLibraryLinkAsNeeded(library_search_path) => {
-                        if !rpaths.contains(&library_search_path)
-                            && !additional_rpaths.contains(&library_search_path)
-                        {
-                            additional_rpaths.push(library_search_path.clone())
-                        }
+            if library_index >= 1 {
+                libraries_linked.remove(library_index - 1);
+            }
+
+            libraries_linked.push((
+                library_name.to_string(),
+                LibraryLinkState {
+                    library_reference: library_reference.clone(),
+                    link_result: final_link_result,
+                },
+            ));
+            // println!("S | {:?}", libraries_linked);
+        }
+    }
+    // Add the final library directories for for shared libraries to the rpaths
+    for (_, link_state) in libraries_linked.iter() {
+        if let Some(link_result) = link_state.link_result.as_ref() {
+            match link_result.link_type {
+                LibraryLinkType::StaticLibraryLinked => {}
+                LibraryLinkType::SharedLibraryLinked
+                | LibraryLinkType::SharedLibraryLinkAsNeeded => {
+                    if !rpaths.contains(&link_result.library_dir)
+                        && !additional_rpaths.contains(&link_result.library_dir)
+                    {
+                        additional_rpaths.push(link_result.library_dir.clone())
                     }
                 }
             }
-            libraries_linked.insert(library_name, (library_reference, final_link_result));
         }
     }
 
@@ -1498,6 +1569,37 @@ mod tests {
             "-L{} -L{} -lstdc++",
             libstdcxx_search_path.display(),
             libstdcxx_libs_search_path.display()
+        );
+        let link_arguments = raw_link_arguments
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let env = LDEnvironment {
+            common: CommonEnvironment {
+                fs_root: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
+            prefix: Some(install_prefix_dir.clone()),
+            ..Default::default()
+        };
+        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+        assert_eq!(
+            result.join(" "),
+            format!(
+                "{} -rpath={}",
+                raw_link_arguments,
+                libstdcxx_libs_search_path.display()
+            )
+        );
+
+        // This is the case where gcc is a build dep and gcc-libs is a runtime dep but the
+        // runtime lib is before the build lib on the search path, the final result should
+        // prefer the runtime lib
+        let raw_link_arguments = format!(
+            "-L{} -L{} -lstdc++",
+            libstdcxx_libs_search_path.display(),
+            libstdcxx_search_path.display()
         );
         let link_arguments = raw_link_arguments
             .split(" ")
