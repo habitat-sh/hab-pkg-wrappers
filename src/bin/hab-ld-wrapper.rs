@@ -883,7 +883,8 @@ fn parse_linker_arguments(
     }
 
     for additional_rpath in additional_rpaths.iter() {
-        filtered_arguments.push(format!("-rpath={}", additional_rpath.display()));
+        filtered_arguments.push("-rpath".to_string());
+        filtered_arguments.push(additional_rpath.display().to_string());
     }
 
     if env.common.is_debug {
