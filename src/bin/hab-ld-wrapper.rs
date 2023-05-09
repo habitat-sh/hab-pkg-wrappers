@@ -804,7 +804,7 @@ fn parse_linker_arguments(
                             library_is_available_at_runtime = result.is_available_at_runtime;
                         } else if result.is_allowed_impure_path {
                             library_will_link = true;
-                            library_is_available_at_runtime = true;
+                            library_is_available_at_runtime = false;
                         }
                     }
                     LibraryLinkType::SharedLibraryLinkAsNeeded => {
