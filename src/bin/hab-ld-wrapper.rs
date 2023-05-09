@@ -11,6 +11,7 @@ use path_absolutize::Absolutize;
 struct LDEnvironment {
     pub common: CommonEnvironment,
     pub dynamic_linker: Option<PathBuf>,
+    pub allowed_impure_paths: Vec<PathBuf>,
     pub ld_run_path: Vec<PathBuf>,
     pub prefix: Option<PathBuf>,
     pub enforce_purity: bool,
@@ -25,6 +26,14 @@ impl Default for LDEnvironment {
         Self {
             common: CommonEnvironment::default(),
             dynamic_linker: std::env::var("HAB_DYNAMIC_LINKER").ok().map(PathBuf::from),
+            allowed_impure_paths: std::env::var("HAB_ALLOWED_IMPURE_PATHS")
+                .map(|value| {
+                    value
+                        .split(":")
+                        .map(PathBuf::from)
+                        .collect::<Vec<PathBuf>>()
+                })
+                .unwrap_or_default(),
             ld_run_path: std::env::var("HAB_LD_RUN_PATH")
                 .map(|value| {
                     value
@@ -54,7 +63,8 @@ impl Default for LDEnvironment {
 }
 
 trait LDPathArg {
-    fn is_bad_path(&self, env: &LDEnvironment) -> bool;
+    fn is_impure_path(&self, env: &LDEnvironment) -> bool;
+    fn is_allowed_impure_path(&self, env: &LDEnvironment) -> bool;
     fn is_pkg_path(&self, env: &LDEnvironment) -> bool;
     fn absolute_path(&self, env: &LDEnvironment) -> PathBuf;
     fn is_shared_library(&self) -> bool;
@@ -66,7 +76,7 @@ where
     T: AsRef<Path>,
 {
     // Checks if a path is a bad path
-    fn is_bad_path(&self, env: &LDEnvironment) -> bool {
+    fn is_impure_path(&self, env: &LDEnvironment) -> bool {
         if !env.enforce_purity {
             return false;
         }
@@ -75,6 +85,12 @@ where
             .absolutize_from(&env.common.cwd)
             .unwrap()
             .to_path_buf();
+        for impure_path in env.allowed_impure_paths.iter() {
+            if path.starts_with(env.common.fs_root.join(impure_path)) {
+                return false;
+            }
+        }
+
         !(path.starts_with(env.common.fs_root.join("hab").join("pkgs"))
             || path.starts_with(env.common.fs_root.join("hab").join("cache"))
             || path.starts_with(
@@ -98,6 +114,17 @@ where
                     .join(&env.tempdir.components().skip(1).collect::<PathBuf>()),
             ))
     }
+
+    fn is_allowed_impure_path(&self, env: &LDEnvironment) -> bool {
+        let path = self.as_ref();
+        for dir in env.allowed_impure_paths.iter() {
+            if path.starts_with(&dir) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn is_pkg_path(&self, env: &LDEnvironment) -> bool {
         let path = self.as_ref();
         path.starts_with(env.common.fs_root.join("hab").join("pkgs"))
@@ -114,7 +141,12 @@ where
         self.as_ref()
             .file_name()
             .and_then(|p| p.to_str())
-            .map(|p| p.ends_with(".so") || p.contains(".so."))
+            .map(|p| {
+                #[cfg(target_os = "linux")]
+                return p.ends_with(".so") || p.contains(".so.");
+                #[cfg(target_os = "macos")]
+                return p.ends_with(".dylib") || p.ends_with(".tbd");
+            })
             .unwrap_or(false)
     }
 
@@ -149,6 +181,7 @@ struct LibraryLinkResult {
     link_type: LibraryLinkType,
     library_file: PathBuf,
     library_dir: PathBuf,
+    is_allowed_impure_path: bool,
     is_pkg_path: bool,
     is_available_at_runtime: bool,
 }
@@ -437,7 +470,7 @@ fn parse_linker_arguments(
                 }
                 LDArgument::LinkArgsFile(_) => {}
                 LDArgument::LibrarySearchPath(search_path, is_prefixed) => {
-                    if search_path.is_bad_path(env) {
+                    if search_path.is_impure_path(env) {
                         skip_argument = true;
                         skip_prev_argument = !is_prefixed;
                     } else {
@@ -473,7 +506,7 @@ fn parse_linker_arguments(
                 }
                 LDArgument::LibraryFilePath(library_file_path) => {
                     let library_file_path = library_file_path.absolute_path(env);
-                    if library_file_path.is_bad_path(env) {
+                    if library_file_path.is_impure_path(env) {
                         skip_argument = true;
                     } else {
                         let library_reference = LibraryReference::FilePath(library_file_path);
@@ -489,7 +522,7 @@ fn parse_linker_arguments(
                     }
                 }
                 LDArgument::RPath(rpath, is_prefixed) => {
-                    if rpath.is_bad_path(env) {
+                    if rpath.is_impure_path(env) {
                         skip_argument = true;
                         skip_prev_argument = !is_prefixed;
                     } else {
@@ -501,7 +534,7 @@ fn parse_linker_arguments(
                 }
                 LDArgument::DynamicLinker(dynamic_linker_path, is_prefixed) => {
                     if let Some(env_dynamic_linker_path) = env.dynamic_linker.as_ref() {
-                        if dynamic_linker_path.is_bad_path(env) {
+                        if dynamic_linker_path.is_impure_path(env) {
                             skip_argument = true;
                             if !is_prefixed {
                                 filtered_arguments.pop();
@@ -512,7 +545,7 @@ fn parse_linker_arguments(
                             ));
                         }
                     } else {
-                        if dynamic_linker_path.is_bad_path(env) {
+                        if dynamic_linker_path.is_impure_path(env) {
                             skip_argument = true;
                             skip_prev_argument = !is_prefixed;
                         }
@@ -520,7 +553,7 @@ fn parse_linker_arguments(
                 }
 
                 LDArgument::Plugin(path, is_prefixed) => {
-                    if path.is_bad_path(env) {
+                    if path.is_impure_path(env) {
                         skip_argument = true;
                         skip_prev_argument = !is_prefixed;
                         bad_plugin = true
@@ -584,14 +617,33 @@ fn parse_linker_arguments(
                                 link_type: LibraryLinkType::StaticLibraryLinked,
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: false,
                             });
                         }
                     } else {
-                        let library_file_path =
-                            library_search_path.join(format!("lib{}.so", library_name));
-                        if library_file_path.is_file() {
+                        let (shared_library_exists, library_file_path) = {
+                            if cfg!(target_os = "linux") {
+                                let library_file_path =
+                                    library_search_path.join(format!("lib{}.so", library_name));
+                                (library_file_path.is_file(), library_file_path)
+                            } else if cfg!(target_os = "macos") {
+                                let library_file_path =
+                                    library_search_path.join(format!("lib{}.tbd", library_name));
+                                if library_file_path.is_file() {
+                                    (true, library_file_path)
+                                } else {
+                                    let library_file_path = library_search_path
+                                        .join(format!("lib{}.dylib", library_name));
+                                    (library_file_path.is_file(), library_file_path)
+                                }
+                            } else {
+                                unimplemented!("This OS is not supported yet")
+                            }
+                        };
+                        if shared_library_exists {
                             library_state.results.push(LibraryLinkResult {
                                 link_type: if library_state.linker_state.is_as_needed {
                                     LibraryLinkType::SharedLibraryLinkAsNeeded
@@ -600,6 +652,8 @@ fn parse_linker_arguments(
                                 },
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: env
                                     .ld_run_path
@@ -613,6 +667,8 @@ fn parse_linker_arguments(
                                     link_type: LibraryLinkType::StaticLibraryLinked,
                                     library_file: library_file_path.clone(),
                                     library_dir: library_search_path.clone(),
+                                    is_allowed_impure_path: library_file_path
+                                        .is_allowed_impure_path(env),
                                     is_pkg_path: library_file_path.is_pkg_path(env),
                                     is_available_at_runtime: false,
                                 });
@@ -632,6 +688,8 @@ fn parse_linker_arguments(
                                 },
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: env
                                     .ld_run_path
@@ -644,6 +702,8 @@ fn parse_linker_arguments(
                                 link_type: LibraryLinkType::StaticLibraryLinked,
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: false,
                             });
@@ -670,6 +730,8 @@ fn parse_linker_arguments(
                                 },
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: env
                                     .ld_run_path
@@ -682,6 +744,8 @@ fn parse_linker_arguments(
                                 link_type: LibraryLinkType::StaticLibraryLinked,
                                 library_file: library_file_path.clone(),
                                 library_dir: library_search_path.clone(),
+                                is_allowed_impure_path: library_file_path
+                                    .is_allowed_impure_path(env),
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: false,
                             });
@@ -737,8 +801,11 @@ fn parse_linker_arguments(
                     LibraryLinkType::SharedLibraryLinked => {
                         if result.is_pkg_path {
                             library_will_link = true;
+                            library_is_available_at_runtime = result.is_available_at_runtime;
+                        } else if result.is_allowed_impure_path {
+                            library_will_link = true;
+                            library_is_available_at_runtime = true;
                         }
-                        library_is_available_at_runtime = result.is_available_at_runtime;
                     }
                     LibraryLinkType::SharedLibraryLinkAsNeeded => {
                         if result.is_pkg_path {
@@ -747,6 +814,8 @@ fn parse_linker_arguments(
                             } else {
                                 library_is_needed = false;
                             }
+                        } else if result.is_allowed_impure_path {
+                            library_will_link = true;
                         }
                         library_is_available_at_runtime = result.is_available_at_runtime;
                     }

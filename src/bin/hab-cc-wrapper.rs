@@ -7,7 +7,7 @@ struct CCEnvironment {
     pub common: CommonEnvironment,
     pub executable_name: String,
     pub ld_bin: PathBuf,
-    pub c_start_files: PathBuf,
+    pub c_start_files: Vec<PathBuf>,
     pub c_std_libs: Vec<PathBuf>,
     pub c_std_headers: Vec<PathBuf>,
     pub cxx_std_libs: Vec<PathBuf>,
@@ -23,7 +23,7 @@ impl Default for CCEnvironment {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             c_start_files: std::env::var("HAB_C_START_FILES")
-                .map(PathBuf::from)
+                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             c_std_libs: std::env::var("HAB_C_STD_LIBS")
                 .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
@@ -87,7 +87,9 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
     filtered_arguments.push(format!("-B{}", env.ld_bin.display()));
     // If start files are needed, add the path to the the libc start files
     if add_start_files {
-        filtered_arguments.push(format!("-B{}", env.c_start_files.display()));
+        for dir in env.c_start_files.iter() {
+            filtered_arguments.push(format!("-B{}", dir.display()));
+        }
     }
     // If C++ add additional libraries and headers
     if is_cxx {
