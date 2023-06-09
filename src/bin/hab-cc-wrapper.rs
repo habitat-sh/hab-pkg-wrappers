@@ -6,12 +6,13 @@ use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 struct CCEnvironment {
     pub common: CommonEnvironment,
     pub executable_name: String,
-    pub ld_bin: PathBuf,
+    pub ld_bin: Option<PathBuf>,
     pub c_start_files: Vec<PathBuf>,
     pub c_std_libs: Vec<PathBuf>,
     pub c_std_headers: Vec<PathBuf>,
     pub cxx_std_libs: Vec<PathBuf>,
     pub cxx_std_headers: Vec<PathBuf>,
+    pub framework_dirs: Vec<PathBuf>,
 }
 
 impl Default for CCEnvironment {
@@ -19,9 +20,7 @@ impl Default for CCEnvironment {
         Self {
             common: Default::default(),
             executable_name: std::env::var("HAB_CC_EXECUTABLE_NAME").unwrap_or_default(),
-            ld_bin: std::env::var("HAB_LD_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_default(),
+            ld_bin: std::env::var("HAB_LD_BIN").map(PathBuf::from).ok(),
             c_start_files: std::env::var("HAB_C_START_FILES")
                 .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
@@ -35,6 +34,9 @@ impl Default for CCEnvironment {
                 .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             cxx_std_headers: std::env::var("HAB_CXX_STD_HEADERS")
+                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            framework_dirs: std::env::var("HAB_FRAMEWORK_DIRS")
                 .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
         }
@@ -54,7 +56,6 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
 
     let mut previous_argument: Option<&String> = None;
     let mut filtered_arguments = Vec::new();
-
     for argument in arguments {
         match (previous_argument.map(|x| x.as_str()), argument.as_str()) {
             (_, "-nostdinc") => {
@@ -74,6 +75,11 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
             (_, "-nostartfiles") => {
                 add_start_files = false;
             }
+            (Some("-isysroot"), _) => {
+                filtered_arguments.pop();
+                previous_argument = filtered_arguments.last();
+                continue;
+            }
             // C++ source files added
             (Some("-x"), current_argument) if current_argument.is_prefixed_with("c++") => {
                 is_cxx = true
@@ -84,7 +90,9 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
         previous_argument = filtered_arguments.last();
     }
     // Add the path to the linker binary
-    filtered_arguments.push(format!("-B{}", env.ld_bin.display()));
+    if let Some(ld_bin) = &env.ld_bin {
+        filtered_arguments.push(format!("-B{}", ld_bin.display()));
+    }
     // If start files are needed, add the path to the the libc start files
     if add_start_files {
         for dir in env.c_start_files.iter() {
@@ -118,6 +126,13 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
             filtered_arguments.push(include_dir.display().to_string());
         }
     }
+
+    // Add Framework directories for MacOS
+    for framework_dir in env.framework_dirs.iter() {
+        filtered_arguments.push("-F".to_string());
+        filtered_arguments.push(framework_dir.display().to_string());
+    }
+
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
