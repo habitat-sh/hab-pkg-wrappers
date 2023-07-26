@@ -8,10 +8,35 @@ use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 use path_absolutize::Absolutize;
 
+pub enum LinkMode {
+    /// Add every path in the LD_RUN_PATH environment variable to the rpath of binaries
+    Complete,
+    /// Adds paths in the LD_RUN_PATH environment variable to the rpath of binaries only 
+    /// if the path actually contains a linked library
+    Incremental,
+}
+
+impl Default for LinkMode {
+    fn default() -> Self {
+        LinkMode::Complete
+    }
+}
+
+impl LinkMode {
+    pub fn maybe_parse(value: impl AsRef<str>) -> Option<LinkMode> {
+        match value.as_ref() {
+            "complete" => Some(LinkMode::Complete),
+            "incremental" => Some(LinkMode::Incremental),
+            _ => None,
+        }
+    }
+}
+
 struct LDEnvironment {
     pub common: CommonEnvironment,
     pub dynamic_linker: Option<PathBuf>,
     pub allowed_impure_paths: Vec<PathBuf>,
+    pub ld_link_mode: LinkMode,
     pub ld_run_path: Vec<PathBuf>,
     pub prefix: Option<PathBuf>,
     pub enforce_purity: bool,
@@ -34,6 +59,10 @@ impl Default for LDEnvironment {
                         .collect::<Vec<PathBuf>>()
                 })
                 .unwrap_or_default(),
+            ld_link_mode: LinkMode::maybe_parse(
+                std::env::var("HAB_LD_LINK_MODE").unwrap_or_default(),
+            )
+            .unwrap_or_default(),
             ld_run_path: std::env::var("HAB_LD_RUN_PATH")
                 .map(|value| {
                     value
@@ -853,29 +882,38 @@ fn parse_linker_arguments(
             // println!("S | {:?}", libraries_linked);
         }
     }
-    // Add the final library directories for for shared libraries to the rpaths
-    for (_, link_state) in libraries_linked.iter() {
-        if let Some(link_result) = link_state.link_result.as_ref() {
-            match link_result.link_type {
-                LibraryLinkType::StaticLibraryLinked => {}
-                LibraryLinkType::SharedLibraryLinked
-                | LibraryLinkType::SharedLibraryLinkAsNeeded => {
-                    if !rpaths.contains(&link_result.library_dir)
-                        && !additional_rpaths.contains(&link_result.library_dir)
-                    {
-                        additional_rpaths.push(link_result.library_dir.clone())
+    match env.ld_link_mode {
+        LinkMode::Complete => {
+            // Add all paths in the LD_RUN_PATH to the rpath
+            additional_rpaths = env.ld_run_path.clone();
+        }
+        LinkMode::Incremental => {
+            // Add the final library directories for all shared libraries to the rpaths
+            for (_, link_state) in libraries_linked.iter() {
+                if let Some(link_result) = link_state.link_result.as_ref() {
+                    match link_result.link_type {
+                        LibraryLinkType::StaticLibraryLinked => {}
+                        LibraryLinkType::SharedLibraryLinked
+                        | LibraryLinkType::SharedLibraryLinkAsNeeded => {
+                            if !rpaths.contains(&link_result.library_dir)
+                                && !additional_rpaths.contains(&link_result.library_dir)
+                            {
+                                additional_rpaths.push(link_result.library_dir.clone())
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
 
-    if !all_needed_libraries_will_link {
-        if let Some(prefix) = env.prefix.as_ref() {
-            for run_path in env.ld_run_path.iter() {
-                if run_path.starts_with(prefix) {
-                    if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path) {
-                        additional_rpaths.push(run_path.clone())
+            if !all_needed_libraries_will_link {
+                if let Some(prefix) = env.prefix.as_ref() {
+                    for run_path in env.ld_run_path.iter() {
+                        if run_path.starts_with(prefix) {
+                            if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path)
+                            {
+                                additional_rpaths.push(run_path.clone())
+                            }
+                        }
                     }
                 }
             }
@@ -1035,1157 +1073,1303 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use hab_pkg_wrappers::env::CommonEnvironment;
-    use std::fs::File;
-    use std::path::Path;
-    use tempdir::TempDir;
-
-    use crate::{parse_linker_arguments, LDEnvironment};
-
-    fn touch(path: impl AsRef<Path>) {
+    fn touch(path: impl AsRef<std::path::Path>) {
         if let Some(parent_dir) = path.as_ref().parent() {
             std::fs::create_dir_all(parent_dir).unwrap();
         }
-        File::create(path).unwrap();
+        std::fs::File::create(path).unwrap();
     }
 
-    // This is the normal scenario when linking in libraries dynamically from other packages
-    // An rpath entry to the library search path is added to ensure the library is found at runtime
-    #[test]
-    fn basic_dynamic_linking() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+    mod complete_ld_link_mode {
+        use hab_pkg_wrappers::env::CommonEnvironment;
+        use tempdir::TempDir;
 
-        let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+        use crate::{parse_linker_arguments, LDEnvironment};
+
+        use super::touch;
+
+        // This scenario checks that whatever directory is present in the LD_RUN_PATH will be added
+        // as an rpath argument regardless of if the library path is provided to the linker and regardless
+        // of if the library is actually linked into the binary. This is the default behaviour as it was
+        // behaviour of the previous shell based ld wrapper script.
+        #[test]
+        fn linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+            let libz_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("zlib")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libz_shared = libc_search_path.join("libc.so");
+            touch(libz_shared);
+            let libm_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libm")
+                .join("version")
+                .join("release")
+                .join("lib");
+
+            // libc is linked with a search path
+            // libz is linked without a search path
+            // libm is not linked
+            let raw_link_arguments = format!("-lc -L {} -lz", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_run_path: vec![
+                    libz_search_path.clone(),
+                    libc_search_path.clone(),
+                    libm_search_path.clone(),
+                ],
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {} -rpath {} -rpath {}",
+                    raw_link_arguments,
+                    libz_search_path.display(),
+                    libc_search_path.display(),
+                    libm_search_path.display()
+                )
+            );
+        }
+
+        // This is the scenario when linking in libraries statically from other packages
+        // No rpath entry is added since the library is statically linked
+        #[test]
+        fn basic_static_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+
+            let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
+    }
+
+    mod incremental_ld_link_mode {
+        use super::touch;
+        use hab_pkg_wrappers::env::CommonEnvironment;
+        use tempdir::TempDir;
+
+        use crate::{parse_linker_arguments, LDEnvironment, LinkMode};
+
+        // This is the normal scenario when linking in libraries dynamically from other packages
+        // An rpath entry to the library search path is added to ensure the library is found at runtime
+        #[test]
+        fn basic_dynamic_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        // This is the scenario when linking in libraries statically from other packages
+        // No rpath entry is added since the library is statically linked
+        #[test]
+        fn basic_static_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+
+            let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
+
+        // This is the scenario when linking in libraries dynamically from other packages
+        // which also have a static library
+        // An rpath entry to the library search path is added to ensure the library is found at runtime
+        #[test]
+        fn shared_lib_preferred_over_static_lib() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        // This is the scenario when linking in libraries statically from other packages
+        // which also have a dynamic library present
+        // No rpath entry is added since the library is statically linked
+        #[test]
+        fn forced_static_lib_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-Bstatic -lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
+
+        #[test]
+        fn dynamic_linking_with_specified_rpath() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-lc -L {0} -rpath {0}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments,);
+        }
+
+        #[test]
+        fn dynamic_linking_with_indirect_search_path() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-lc -L {}/../lib", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn dynamic_linking_with_indirect_search_path_and_indirect_specified_rpath() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!(
+                "-lc -L {0}/../lib -rpath {0}/../lib",
                 libc_search_path.display()
-            )
-        );
-    }
-
-    // This is the scenario when linking in libraries statically from other packages
-    // No rpath entry is added since the library is statically linked
-    #[test]
-    fn basic_static_linking() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_static = libc_search_path.join("libc.a");
-        touch(libc_static);
-
-        let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments,);
+        }
 
-    // This is the scenario when linking in libraries dynamically from other packages
-    // which also have a static library
-    // An rpath entry to the library search path is added to ensure the library is found at runtime
-    #[test]
-    fn shared_lib_preferred_over_static_lib() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_static = libc_search_path.join("libc.a");
-        touch(libc_static);
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+        // This is the case when a binary/library links dynamically against one of it's own package's libraries
+        // An rpath entry to the install path is added to ensure the library is found at runtime
+        #[test]
+        fn link_against_shared_library_in_build_package() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let build_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("cache")
+                .join("src")
+                .join("openssl");
+            let libcrypto_shared = build_dir.join("libcrypto.so");
+            touch(&libcrypto_shared);
 
-        let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Passed as -l flag
+            let raw_link_arguments = String::from("-L. -lcrypto");
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir.clone(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libc_search_path.display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
 
-    // This is the scenario when linking in libraries statically from other packages
-    // which also have a dynamic library present
-    // No rpath entry is added since the library is statically linked
-    #[test]
-    fn forced_static_lib_linking() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_static = libc_search_path.join("libc.a");
-        touch(libc_static);
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
-
-        let raw_link_arguments = format!("-Bstatic -lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Passed as absolute path to shared library
+            let raw_link_arguments = format!("-L. {}", libcrypto_shared.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir.clone(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
 
-    #[test]
-    fn dynamic_linking_with_specified_rpath() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
-
-        let raw_link_arguments = format!("-lc -L {0} -rpath {0}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Passed as exact filename to shared library
+            let raw_link_arguments = String::from("-L. -l:libcrypto.so");
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir,
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments,);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
+        }
 
-    #[test]
-    fn dynamic_linking_with_indirect_search_path() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+        // This is the case when a binary/library links dynamically against both the old and newly built version of a library
+        // in the same package, this happens most importantly in glibc
+        // An rpath entry to the install path is added to ensure the library is found at runtime
+        #[test]
+        fn link_against_newer_version_of_same_shared_library_in_build_package() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let old_install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("old-version")
+                .join("release");
+            let old_libc_shared = old_install_prefix_dir.join("libc.so");
+            touch(&old_libc_shared);
 
-        let raw_link_arguments = format!("-lc -L {}/../lib", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release");
+            let build_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("cache")
+                .join("src")
+                .join("glibc");
+            let new_libc_shared = build_dir.join("libc.so");
+            touch(&new_libc_shared);
+
+            // New library passed via build search path
+            let raw_link_arguments = format!(
+                "-L{} -L{} {} -lc",
+                build_dir.display(),
+                old_install_prefix_dir.display(),
+                new_libc_shared.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir.clone(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libc_search_path.display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
 
-    #[test]
-    fn dynamic_linking_with_indirect_search_path_and_indirect_specified_rpath() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
-
-        let raw_link_arguments = format!(
-            "-lc -L {0}/../lib -rpath {0}/../lib",
-            libc_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // New library passed as absolute path
+            let raw_link_arguments = format!(
+                "-L{} {} -lc",
+                old_install_prefix_dir.display(),
+                new_libc_shared.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir.clone(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments,);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
 
-    // This is the case when a binary/library links dynamically against one of it's own package's libraries
-    // An rpath entry to the install path is added to ensure the library is found at runtime
-    #[test]
-    fn link_against_shared_library_in_build_package() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let build_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("cache")
-            .join("src")
-            .join("openssl");
-        let libcrypto_shared = build_dir.join("libcrypto.so");
-        touch(&libcrypto_shared);
+            let new_libc_shared = build_dir.join("libc.so.new");
+            touch(&new_libc_shared);
 
-        // Passed as -l flag
-        let raw_link_arguments = String::from("-L. -lcrypto");
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir.clone(),
+            // New library passed as exact file name
+            let raw_link_arguments =
+                format!("-L{} -l:libc.so.new -lc", old_install_prefix_dir.display(),);
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir.clone(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_prefix_dir.join("lib")],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    install_prefix_dir.join("lib").display()
+                )
+            );
+        }
 
-        // Passed as absolute path to shared library
-        let raw_link_arguments = format!("-L. {}", libcrypto_shared.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir.clone(),
+        // This is the case when a binary/library links dynamically against one of it's own package's libraries
+        // No rpath entry is added since the library is statically linked
+        #[test]
+        fn link_against_static_library_in_build_package() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let build_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("cache")
+                .join("src")
+                .join("openssl");
+            let libcrypto_static = build_dir.join("libcrypto.a");
+            touch(libcrypto_static);
+
+            let raw_link_arguments = String::from("-L. -lcrypto");
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    cwd: build_dir,
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
 
-        // Passed as exact filename to shared library
-        let raw_link_arguments = String::from("-L. -l:libcrypto.so");
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir,
+        #[test]
+        fn link_against_same_library_in_build_and_runtime_dep() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let install_lib_dir = install_prefix_dir.join("lib");
+            let libstdcxx_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("gcc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libstdcxx_shared = libstdcxx_search_path.join("libstdc++.so");
+            touch(&libstdcxx_shared);
+            let libstdcxx_libs_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("gcc-libs")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libstdcxx_libs_shared = libstdcxx_libs_search_path.join("libstdc++.so");
+            touch(&libstdcxx_libs_shared);
+
+            // This is the case where gcc and gcc-libs are only a build dep
+            let raw_link_arguments = format!(
+                "-L{} -L{} -lstdc++",
+                libstdcxx_search_path.display(),
+                libstdcxx_libs_search_path.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libstdcxx_search_path.display()
+                )
+            );
 
-    // This is the case when a binary/library links dynamically against both the old and newly built version of a library
-    // in the same package, this happens most importantly in glibc
-    // An rpath entry to the install path is added to ensure the library is found at runtime
-    #[test]
-    fn link_against_newer_version_of_same_shared_library_in_build_package() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let old_install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("old-version")
-            .join("release");
-        let old_libc_shared = old_install_prefix_dir.join("libc.so");
-        touch(&old_libc_shared);
-
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release");
-        let build_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("cache")
-            .join("src")
-            .join("glibc");
-        let new_libc_shared = build_dir.join("libc.so");
-        touch(&new_libc_shared);
-
-        // New library passed via build search path
-        let raw_link_arguments = format!(
-            "-L{} -L{} {} -lc",
-            build_dir.display(),
-            old_install_prefix_dir.display(),
-            new_libc_shared.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir.clone(),
+            // This is the case where gcc is a build dep gcc-libs is a runtime dep
+            let raw_link_arguments = format!(
+                "-L{} -L{} -lstdc++",
+                libstdcxx_search_path.display(),
+                libstdcxx_libs_search_path.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libstdcxx_libs_search_path.display()
+                )
+            );
 
-        // New library passed as absolute path
-        let raw_link_arguments = format!(
-            "-L{} {} -lc",
-            old_install_prefix_dir.display(),
-            new_libc_shared.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir.clone(),
-                ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
-
-        let new_libc_shared = build_dir.join("libc.so.new");
-        touch(&new_libc_shared);
-
-        // New library passed as exact file name
-        let raw_link_arguments =
-            format!("-L{} -l:libc.so.new -lc", old_install_prefix_dir.display(),);
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir.clone(),
-                ..Default::default()
-            },
-            ld_run_path: vec![install_prefix_dir.join("lib")],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                install_prefix_dir.join("lib").display()
-            )
-        );
-    }
-
-    // This is the case when a binary/library links dynamically against one of it's own package's libraries
-    // No rpath entry is added since the library is statically linked
-    #[test]
-    fn link_against_static_library_in_build_package() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let build_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("cache")
-            .join("src")
-            .join("openssl");
-        let libcrypto_static = build_dir.join("libcrypto.a");
-        touch(libcrypto_static);
-
-        let raw_link_arguments = String::from("-L. -lcrypto");
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                cwd: build_dir,
-                ..Default::default()
-            },
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
-    }
-
-    #[test]
-    fn link_against_same_library_in_build_and_runtime_dep() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let install_lib_dir = install_prefix_dir.join("lib");
-        let libstdcxx_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("gcc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libstdcxx_shared = libstdcxx_search_path.join("libstdc++.so");
-        touch(&libstdcxx_shared);
-        let libstdcxx_libs_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("gcc-libs")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libstdcxx_libs_shared = libstdcxx_libs_search_path.join("libstdc++.so");
-        touch(&libstdcxx_libs_shared);
-
-        // This is the case where gcc and gcc-libs are only a build dep
-        let raw_link_arguments = format!(
-            "-L{} -L{} -lstdc++",
-            libstdcxx_search_path.display(),
-            libstdcxx_libs_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
+            // This is the case where gcc is a build dep and gcc-libs is a runtime dep but the
+            // runtime lib is before the build lib on the search path, the final result should
+            // prefer the runtime lib
+            let raw_link_arguments = format!(
+                "-L{} -L{} -lstdc++",
+                libstdcxx_libs_search_path.display(),
                 libstdcxx_search_path.display()
-            )
-        );
-
-        // This is the case where gcc is a build dep gcc-libs is a runtime dep
-        let raw_link_arguments = format!(
-            "-L{} -L{} -lstdc++",
-            libstdcxx_search_path.display(),
-            libstdcxx_libs_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libstdcxx_libs_search_path.display()
-            )
-        );
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libstdcxx_libs_search_path.display()
+                )
+            );
+        }
 
-        // This is the case where gcc is a build dep and gcc-libs is a runtime dep but the
-        // runtime lib is before the build lib on the search path, the final result should
-        // prefer the runtime lib
-        let raw_link_arguments = format!(
-            "-L{} -L{} -lstdc++",
-            libstdcxx_libs_search_path.display(),
-            libstdcxx_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+        #[test]
+        fn link_as_needed_without_ld_run_path_hint() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let install_lib_dir = install_prefix_dir.join("lib");
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_lib_dir],
+                prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
-            },
-            ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libstdcxx_libs_search_path.display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
 
-    #[test]
-    fn link_as_needed_without_ld_run_path_hint() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let install_lib_dir = install_prefix_dir.join("lib");
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_static = libc_search_path.join("libc.a");
-        touch(libc_static);
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+        #[test]
+        fn link_as_needed_with_ld_run_path_hint() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let install_lib_dir = install_prefix_dir.join("lib");
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
 
-        let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                prefix: Some(install_prefix_dir.clone()),
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
                 ..Default::default()
-            },
-            ld_run_path: vec![install_lib_dir],
-            prefix: Some(install_prefix_dir.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display()
+                )
+            );
+        }
 
-    #[test]
-    fn link_as_needed_with_ld_run_path_hint() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let install_lib_dir = install_prefix_dir.join("lib");
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_static = libc_search_path.join("libc.a");
-        touch(libc_static);
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+        #[test]
+        fn push_state_as_needed_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let install_lib_dir = install_prefix_dir.join("lib");
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(&libc_shared);
+            let libz_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("zlib")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libz_shared = libz_search_path.join("libz.so");
+            touch(&libz_shared);
 
-        let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            prefix: Some(install_prefix_dir.clone()),
-            ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libc_search_path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn push_state_as_needed_linking() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let install_prefix_dir = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("openssl")
-            .join("version")
-            .join("release");
-        let install_lib_dir = install_prefix_dir.join("lib");
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(&libc_shared);
-        let libz_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("zlib")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libz_shared = libz_search_path.join("libz.so");
-        touch(&libz_shared);
-
-        // without ld run path hint
-        let raw_link_arguments = format!(
-            "-L {} -L {} --push-state --as-needed -lc --pop-state -lz",
-            libc_search_path.display(),
-            libz_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            prefix: Some(install_prefix_dir.clone()),
-            ld_run_path: vec![install_lib_dir.clone()],
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libz_search_path.display()
-            )
-        );
-
-        // with ld run path hint
-        let raw_link_arguments = format!(
-            "-L {} -L {} --push-state --as-needed -lc --pop-state -lz",
-            libc_search_path.display(),
-            libz_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            ld_run_path: vec![libc_search_path.clone()],
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={} -rpath={}",
-                raw_link_arguments,
+            // without ld run path hint
+            let raw_link_arguments = format!(
+                "-L {} -L {} --push-state --as-needed -lc --pop-state -lz",
                 libc_search_path.display(),
                 libz_search_path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn push_state_static_and_dynamic_linking() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(&libc_shared);
-        let libz_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("zlib")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libz_shared = libz_search_path.join("libz.so");
-        let libz_static = libz_search_path.join("libz.a");
-        touch(&libz_shared);
-        touch(&libz_static);
-
-        // without ld run path hint
-        let raw_link_arguments = format!(
-            "-L {} -L {} --push-state -Bstatic -lz --pop-state -lc",
-            libc_search_path.display(),
-            libz_search_path.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                prefix: Some(install_prefix_dir.clone()),
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![install_lib_dir.clone()],
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "{} -rpath={}",
-                raw_link_arguments,
-                libc_search_path.display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libz_search_path.display()
+                )
+            );
 
-    #[test]
-    fn impure_library_search_path_filtering() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir.path().join("usr").join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
-
-        let raw_link_arguments = format!("-lc -L {0} -L{0} -L{0}/../../usr/lib -L {0}/../../usr/lib -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "-lc -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm",
-                libc_search_path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn impure_absolute_library_path_filtering() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let impure_libz_search_path = temp_dir.path().join("usr").join("lib");
-        let impure_libz_shared = impure_libz_search_path.join("libz.so");
-        touch(&impure_libz_shared);
-
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(&libc_shared);
-
-        let raw_link_arguments = format!(
-            "-L {} -lc {} {}",
-            libc_search_path.display(),
-            impure_libz_shared.display(),
-            libc_shared.display()
-        );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "-L {} -lc {} -rpath={0}",
+            // with ld run path hint
+            let raw_link_arguments = format!(
+                "-L {} -L {} --push-state --as-needed -lc --pop-state -lz",
                 libc_search_path.display(),
+                libz_search_path.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ld_run_path: vec![libc_search_path.clone()],
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display(),
+                    libz_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn push_state_static_and_dynamic_linking() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(&libc_shared);
+            let libz_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("zlib")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libz_shared = libz_search_path.join("libz.so");
+            let libz_static = libz_search_path.join("libz.a");
+            touch(&libz_shared);
+            touch(&libz_static);
+
+            // without ld run path hint
+            let raw_link_arguments = format!(
+                "-L {} -L {} --push-state -Bstatic -lz --pop-state -lc",
+                libc_search_path.display(),
+                libz_search_path.display()
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "{} -rpath {}",
+                    raw_link_arguments,
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn impure_library_search_path_filtering() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir.path().join("usr").join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("-lc -L {0} -L{0} -L{0}/../../usr/lib -L {0}/../../usr/lib -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-lc -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm",
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn impure_absolute_library_path_filtering() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let impure_libz_search_path = temp_dir.path().join("usr").join("lib");
+            let impure_libz_shared = impure_libz_search_path.join("libz.so");
+            touch(&impure_libz_shared);
+
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(&libc_shared);
+
+            let raw_link_arguments = format!(
+                "-L {} -lc {} {}",
+                libc_search_path.display(),
+                impure_libz_shared.display(),
                 libc_shared.display()
-            )
-        );
-    }
+            );
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-L {} -lc {} -rpath {0}",
+                    libc_search_path.display(),
+                    libc_shared.display()
+                )
+            );
+        }
 
-    #[test]
-    fn impure_plugin_filtering() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let impure_liblto_plugin = temp_dir
-            .path()
-            .join("usr")
-            .join("lib")
-            .join("gcc")
-            .join("aarch64-linux-gnu")
-            .join("9")
-            .join("liblto_plugin.so");
-        touch(&impure_liblto_plugin);
-        let liblto_plugin = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("binutils")
-            .join("version")
-            .join("release")
-            .join("lib")
-            .join("liblto_plugin.so");
-        touch(&liblto_plugin);
+        #[test]
+        fn impure_plugin_filtering() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let impure_liblto_plugin = temp_dir
+                .path()
+                .join("usr")
+                .join("lib")
+                .join("gcc")
+                .join("aarch64-linux-gnu")
+                .join("9")
+                .join("liblto_plugin.so");
+            touch(&impure_liblto_plugin);
+            let liblto_plugin = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("binutils")
+                .join("version")
+                .join("release")
+                .join("lib")
+                .join("liblto_plugin.so");
+            touch(&liblto_plugin);
 
-        let raw_link_arguments = format!(
+            let raw_link_arguments = format!(
             "-plugin {} -plugin-opt=option1 -plugin-opt=option2 -plugin={} -plugin-opt=option3 -lz -plugin {0} -plugin-opt=option4 -plugin-opt=option5",
             impure_liblto_plugin.display(),
             liblto_plugin.display()
         );
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!(
-                "-plugin={} -plugin-opt=option3 -lz",
-                liblto_plugin.display()
-            )
-        );
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-plugin={} -plugin-opt=option3 -lz",
+                    liblto_plugin.display()
+                )
+            );
+        }
 
-    #[test]
-    fn impure_dynamic_linker_replacement() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let dynamic_linker = libc_search_path.join("ld-linux-aarch64.so.1");
-        let dynamic_linker_alternative = libc_search_path.join("ld-linux-musl.so");
-        touch(&dynamic_linker);
-        touch(&dynamic_linker_alternative);
-        let impure_dynamic_linker = temp_dir
-            .path()
-            .join("usr")
-            .join("lib")
-            .join("ld-linux-aarch64.so.1");
-        touch(&impure_dynamic_linker);
+        #[test]
+        fn impure_dynamic_linker_replacement() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let dynamic_linker = libc_search_path.join("ld-linux-aarch64.so.1");
+            let dynamic_linker_alternative = libc_search_path.join("ld-linux-musl.so");
+            touch(&dynamic_linker);
+            touch(&dynamic_linker_alternative);
+            let impure_dynamic_linker = temp_dir
+                .path()
+                .join("usr")
+                .join("lib")
+                .join("ld-linux-aarch64.so.1");
+            touch(&impure_dynamic_linker);
 
-        let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                dynamic_linker: Some(dynamic_linker.clone()),
                 ..Default::default()
-            },
-            dynamic_linker: Some(dynamic_linker.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(
-            result.join(" "),
-            format!("-dynamic-linker={}", dynamic_linker.display())
-        );
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!("-dynamic-linker={}", dynamic_linker.display())
+            );
 
-        // Impure dynamic linker without env is ignored
-        let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Impure dynamic linker without env is ignored
+            let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), String::from(""));
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), String::from(""));
 
-        // Pure dynamic linker is not replaced by specified linker
-        let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Pure dynamic linker is not replaced by specified linker
+            let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
+                dynamic_linker: Some(dynamic_linker_alternative.clone()),
                 ..Default::default()
-            },
-            dynamic_linker: Some(dynamic_linker_alternative.clone()),
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
 
-        // Pure dynamic linker is not replaced is alternative is not specified
-        let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            // Pure dynamic linker is not replaced is alternative is not specified
+            let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
-    }
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
 
-    #[test]
-    fn ignores_output_shared_library_names() {
-        let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-        let libc_search_path = temp_dir
-            .path()
-            .join("hab")
-            .join("pkgs")
-            .join("core")
-            .join("glibc")
-            .join("version")
-            .join("release")
-            .join("lib");
-        let libc_shared = libc_search_path.join("libc.so");
-        touch(libc_shared);
+        #[test]
+        fn ignores_output_shared_library_names() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
 
-        let raw_link_arguments = format!("-L {} -o libc.so -h libc.so", libc_search_path.display());
-        let link_arguments = raw_link_arguments
-            .split(" ")
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let env = LDEnvironment {
-            common: CommonEnvironment {
-                fs_root: temp_dir.path().to_path_buf(),
+            let raw_link_arguments =
+                format!("-L {} -o libc.so -h libc.so", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_link_mode: LinkMode::Incremental,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-        assert_eq!(result.join(" "), raw_link_arguments);
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
     }
 }
