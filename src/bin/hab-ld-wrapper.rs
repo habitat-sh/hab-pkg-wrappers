@@ -8,12 +8,13 @@ use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 use path_absolutize::Absolutize;
 
+#[derive(Debug, PartialEq)]
 pub enum LinkMode {
-    /// Add every path in the LD_RUN_PATH environment variable to the rpath of binaries
+    /// Ensures every path in the LD_RUN_PATH environment variable is added to the rpath of binaries
     Complete,
-    /// Adds paths in the LD_RUN_PATH environment variable to the rpath of binaries only 
+    /// Adds paths in the LD_RUN_PATH environment variable to the rpath of binaries only
     /// if the path actually contains a linked library
-    Incremental,
+    Minimal,
 }
 
 impl Default for LinkMode {
@@ -26,7 +27,7 @@ impl LinkMode {
     pub fn maybe_parse(value: impl AsRef<str>) -> Option<LinkMode> {
         match value.as_ref() {
             "complete" => Some(LinkMode::Complete),
-            "incremental" => Some(LinkMode::Incremental),
+            "minimal" => Some(LinkMode::Minimal),
             _ => None,
         }
     }
@@ -67,6 +68,7 @@ impl Default for LDEnvironment {
                 .map(|value| {
                     value
                         .split(":")
+                        .filter(|p| !p.is_empty())
                         .map(PathBuf::from)
                         .collect::<Vec<PathBuf>>()
                 })
@@ -882,40 +884,40 @@ fn parse_linker_arguments(
             // println!("S | {:?}", libraries_linked);
         }
     }
-    match env.ld_link_mode {
-        LinkMode::Complete => {
-            // Add all paths in the LD_RUN_PATH to the rpath
-            additional_rpaths = env.ld_run_path.clone();
-        }
-        LinkMode::Incremental => {
-            // Add the final library directories for all shared libraries to the rpaths
-            for (_, link_state) in libraries_linked.iter() {
-                if let Some(link_result) = link_state.link_result.as_ref() {
-                    match link_result.link_type {
-                        LibraryLinkType::StaticLibraryLinked => {}
-                        LibraryLinkType::SharedLibraryLinked
-                        | LibraryLinkType::SharedLibraryLinkAsNeeded => {
-                            if !rpaths.contains(&link_result.library_dir)
-                                && !additional_rpaths.contains(&link_result.library_dir)
-                            {
-                                additional_rpaths.push(link_result.library_dir.clone())
-                            }
-                        }
+
+    // Add the final library directories for all shared libraries to the rpaths
+    for (_, link_state) in libraries_linked.iter() {
+        if let Some(link_result) = link_state.link_result.as_ref() {
+            match link_result.link_type {
+                LibraryLinkType::StaticLibraryLinked => {}
+                LibraryLinkType::SharedLibraryLinked
+                | LibraryLinkType::SharedLibraryLinkAsNeeded => {
+                    if !rpaths.contains(&link_result.library_dir)
+                        && !additional_rpaths.contains(&link_result.library_dir)
+                    {
+                        additional_rpaths.push(link_result.library_dir.clone())
                     }
                 }
             }
+        }
+    }
 
-            if !all_needed_libraries_will_link {
-                if let Some(prefix) = env.prefix.as_ref() {
-                    for run_path in env.ld_run_path.iter() {
-                        if run_path.starts_with(prefix) {
-                            if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path)
-                            {
-                                additional_rpaths.push(run_path.clone())
-                            }
-                        }
+    if !all_needed_libraries_will_link {
+        if let Some(prefix) = env.prefix.as_ref() {
+            for run_path in env.ld_run_path.iter() {
+                if run_path.starts_with(prefix) {
+                    if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path) {
+                        additional_rpaths.push(run_path.clone())
                     }
                 }
+            }
+        }
+    }
+    // Ensure all paths in the LD_RUN_PATH are added to the rpath
+    if env.ld_link_mode == LinkMode::Complete {
+        for search_dir in env.ld_run_path.iter() {
+            if !rpaths.contains(&search_dir) && !additional_rpaths.contains(&search_dir) {
+                additional_rpaths.push(search_dir.clone())
             }
         }
     }
@@ -1106,6 +1108,17 @@ mod tests {
                 .join("lib");
             let libc_shared = libc_search_path.join("libc.so");
             touch(libc_shared);
+            let libx_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("xlib")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libx_shared = libx_search_path.join("libx.so");
+            touch(libx_shared);
             let libz_search_path = temp_dir
                 .path()
                 .join("hab")
@@ -1115,7 +1128,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libz_shared = libc_search_path.join("libc.so");
+            let libz_shared = libz_search_path.join("libz.so");
             touch(libz_shared);
             let libm_search_path = temp_dir
                 .path()
@@ -1128,9 +1141,14 @@ mod tests {
                 .join("lib");
 
             // libc is linked with a search path
+            // libx is linked with a search path not present in LD_RUN_PATH
             // libz is linked without a search path
             // libm is not linked
-            let raw_link_arguments = format!("-lc -L {} -lz", libc_search_path.display());
+            let raw_link_arguments = format!(
+                "-lc -L {} -lx -L {} -lz",
+                libc_search_path.display(),
+                libx_search_path.display()
+            );
             let link_arguments = raw_link_arguments
                 .split(" ")
                 .map(|x| x.to_string())
@@ -1151,50 +1169,19 @@ mod tests {
             assert_eq!(
                 result.join(" "),
                 format!(
-                    "{} -rpath {} -rpath {} -rpath {}",
+                    "{} -rpath {} -rpath {} -rpath {} -rpath {}",
                     raw_link_arguments,
-                    libz_search_path.display(),
                     libc_search_path.display(),
+                    libx_search_path.display(),
+                    libz_search_path.display(),
                     libm_search_path.display()
                 )
             );
         }
 
-        // This is the scenario when linking in libraries statically from other packages
-        // No rpath entry is added since the library is statically linked
-        #[test]
-        fn basic_static_linking() {
-            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
-            let libc_search_path = temp_dir
-                .path()
-                .join("hab")
-                .join("pkgs")
-                .join("core")
-                .join("glibc")
-                .join("version")
-                .join("release")
-                .join("lib");
-            let libc_static = libc_search_path.join("libc.a");
-            touch(libc_static);
-
-            let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
-            let link_arguments = raw_link_arguments
-                .split(" ")
-                .map(|x| x.to_string())
-                .collect::<Vec<String>>();
-            let env = LDEnvironment {
-                common: CommonEnvironment {
-                    fs_root: temp_dir.path().to_path_buf(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-            assert_eq!(result.join(" "), raw_link_arguments);
-        }
     }
 
-    mod incremental_ld_link_mode {
+    mod minimal_ld_link_mode {
         use super::touch;
         use hab_pkg_wrappers::env::CommonEnvironment;
         use tempdir::TempDir;
@@ -1228,7 +1215,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1269,7 +1256,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1306,7 +1293,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1350,7 +1337,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1382,7 +1369,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1414,7 +1401,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1456,7 +1443,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -1497,7 +1484,7 @@ mod tests {
                     cwd: build_dir.clone(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1524,7 +1511,7 @@ mod tests {
                     cwd: build_dir.clone(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1551,7 +1538,7 @@ mod tests {
                     cwd: build_dir,
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1618,7 +1605,7 @@ mod tests {
                     cwd: build_dir.clone(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1649,7 +1636,7 @@ mod tests {
                     cwd: build_dir.clone(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1680,7 +1667,7 @@ mod tests {
                     cwd: build_dir.clone(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_prefix_dir.join("lib")],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1729,7 +1716,7 @@ mod tests {
                     cwd: build_dir,
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
             };
@@ -1787,7 +1774,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
             };
@@ -1816,7 +1803,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1848,7 +1835,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_lib_dir.clone(), libstdcxx_libs_search_path.clone()],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1900,7 +1887,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_lib_dir],
                 prefix: Some(install_prefix_dir.clone()),
                 ..Default::default()
@@ -1946,7 +1933,7 @@ mod tests {
                     ..Default::default()
                 },
                 prefix: Some(install_prefix_dir.clone()),
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
                 ..Default::default()
             };
@@ -2012,7 +1999,7 @@ mod tests {
                     ..Default::default()
                 },
                 prefix: Some(install_prefix_dir.clone()),
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![install_lib_dir.clone()],
                 ..Default::default()
             };
@@ -2041,7 +2028,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ld_run_path: vec![libc_search_path.clone()],
                 ..Default::default()
             };
@@ -2100,7 +2087,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2131,7 +2118,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2178,7 +2165,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2230,7 +2217,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2276,7 +2263,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 dynamic_linker: Some(dynamic_linker.clone()),
                 ..Default::default()
             };
@@ -2297,7 +2284,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2314,7 +2301,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 dynamic_linker: Some(dynamic_linker_alternative.clone()),
                 ..Default::default()
             };
@@ -2332,7 +2319,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2365,7 +2352,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
-                ld_link_mode: LinkMode::Incremental,
+                ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
