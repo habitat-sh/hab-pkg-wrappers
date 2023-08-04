@@ -52,7 +52,7 @@ pub enum LinkMode {
 
 impl Default for LinkMode {
     fn default() -> Self {
-        LinkMode::Complete
+        LinkMode::Minimal
     }
 }
 
@@ -1212,7 +1212,7 @@ mod tests {
         use hab_pkg_wrappers::env::CommonEnvironment;
         use tempdir::TempDir;
 
-        use crate::{parse_linker_arguments, LDEnvironment};
+        use crate::{parse_linker_arguments, LDEnvironment, LinkMode};
 
         use super::touch;
 
@@ -1284,6 +1284,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                ld_link_mode: LinkMode::Complete,
                 ld_run_path: vec![
                     libz_search_path.clone(),
                     libc_search_path.clone(),
