@@ -9,6 +9,39 @@ use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 use path_absolutize::Absolutize;
 
 #[derive(Debug, PartialEq)]
+pub enum WrappedLinkerName {
+    GNUBFD,
+    Other,
+}
+
+impl Default for WrappedLinkerName {
+    fn default() -> Self {
+        WrappedLinkerName::Other
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum LibHabState {
+    /// libhab has been interposed with a dynamic C library
+    Interposed,
+    /// libhab has been wrapped over a static C library
+    Wrapped,
+    /// libhab cannot be wrapped over a static C library because the linker does not support it
+    WontWrap,
+    /// libhab has not been linked
+    NotLinked,
+}
+
+impl WrappedLinkerName {
+    pub fn parse(value: impl AsRef<str>) -> WrappedLinkerName {
+        match value.as_ref() {
+            "GNUBFD" => WrappedLinkerName::GNUBFD,
+            _ => WrappedLinkerName::Other,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum LinkMode {
     /// Ensures every path in the LD_RUN_PATH environment variable is added to the rpath of binaries
     Complete,
@@ -39,6 +72,8 @@ struct LDEnvironment {
     pub allowed_impure_paths: Vec<PathBuf>,
     pub ld_link_mode: LinkMode,
     pub ld_run_path: Vec<PathBuf>,
+    pub ld_name: WrappedLinkerName,
+    pub lib_hab_path: Option<PathBuf>,
     pub prefix: Option<PathBuf>,
     pub enforce_purity: bool,
     pub tmp: PathBuf,
@@ -73,10 +108,15 @@ impl Default for LDEnvironment {
                         .collect::<Vec<PathBuf>>()
                 })
                 .unwrap_or_default(),
+            ld_name: std::env::var("HAB_WRAPPED_LINKER_NAME")
+                .ok()
+                .map(|value| WrappedLinkerName::parse(value))
+                .unwrap_or_default(),
+            lib_hab_path: std::env::var("HAB_LIBHAB_PATH").ok().map(PathBuf::from),
             prefix: std::env::var("PREFIX").ok().map(PathBuf::from),
             enforce_purity: std::env::var("HAB_ENFORCE_PURITY")
                 .map(|value| value == "1")
-                .unwrap_or(true),
+                .unwrap_or(false),
             tmp: std::env::var("TMP")
                 .map(PathBuf::from)
                 .unwrap_or(std::env::temp_dir()),
@@ -473,6 +513,59 @@ fn effective_library_name(library_reference: &LibraryReference) -> Option<String
             .map(|(library_name, _)| library_name.to_string()),
     }
 }
+
+fn libhab_link(
+    env: &LDEnvironment,
+    current_linker_state: &LinkerState,
+    current_libhab_state: LibHabState,
+    library_references: &mut Vec<(LibraryReference, LibraryReferenceState)>,
+    library_search_paths: &mut Vec<PathBuf>,
+    filtered_arguments: &mut Vec<String>,
+) -> LibHabState {
+    if current_libhab_state != LibHabState::NotLinked {
+        current_libhab_state
+    } else {
+        if let Some(lib_hab_path) = env.lib_hab_path.as_ref() {
+            if current_linker_state.is_static {
+                if env.ld_name == WrappedLinkerName::GNUBFD {
+                    library_references.push((
+                        LibraryReference::Name("habw".to_string()),
+                        LibraryReferenceState {
+                            linker_state: *current_linker_state,
+                            library_name: Some("habw".to_string()),
+                            results: Vec::new(),
+                        },
+                    ));
+                    library_search_paths.push(lib_hab_path.clone());
+                    filtered_arguments.push("--wrap=dlopen".to_string());
+                    filtered_arguments.push("-lhabw".to_string());
+                    filtered_arguments.push("-L".to_string());
+                    filtered_arguments.push(format!("{}", lib_hab_path.display()));
+                    LibHabState::Wrapped
+                } else {
+                    LibHabState::WontWrap
+                }
+            } else {
+                library_references.push((
+                    LibraryReference::Name("habi".to_string()),
+                    LibraryReferenceState {
+                        linker_state: *current_linker_state,
+                        library_name: Some("habi".to_string()),
+                        results: Vec::new(),
+                    },
+                ));
+                library_search_paths.push(lib_hab_path.clone());
+                filtered_arguments.push("-lhabi".to_string());
+                filtered_arguments.push("-L".to_string());
+                filtered_arguments.push(format!("{}", lib_hab_path.display()));
+                LibHabState::Interposed
+            }
+        } else {
+            current_libhab_state
+        }
+    }
+}
+
 fn parse_linker_arguments(
     arguments: impl Iterator<Item = String>,
     env: &LDEnvironment,
@@ -488,6 +581,7 @@ fn parse_linker_arguments(
     let mut additional_rpaths: Vec<PathBuf> = vec![];
     let mut library_references = Vec::new();
     let mut libraries_linked = Vec::new();
+    let mut libhab_state = LibHabState::NotLinked;
 
     for argument in arguments {
         let mut skip_argument = false;
@@ -514,6 +608,16 @@ fn parse_linker_arguments(
                 LDArgument::LibraryName(library_name, _) => {
                     let library_reference = LibraryReference::Name(library_name.to_string());
                     let library_name = effective_library_name(&library_reference);
+                    if library_name.as_ref().map_or(false, |name| name == "c") {
+                        libhab_state = libhab_link(
+                            env,
+                            &current_linker_state,
+                            libhab_state,
+                            &mut library_references,
+                            &mut library_search_paths,
+                            &mut filtered_arguments,
+                        );
+                    }
                     library_references.push((
                         library_reference,
                         LibraryReferenceState {
@@ -526,6 +630,16 @@ fn parse_linker_arguments(
                 LDArgument::LibraryFileName(library_file_name, _) => {
                     let library_reference = LibraryReference::FileName(library_file_name.into());
                     let library_name = effective_library_name(&library_reference);
+                    if library_name.as_ref().map_or(false, |name| name == "c") {
+                        libhab_state = libhab_link(
+                            env,
+                            &current_linker_state,
+                            libhab_state,
+                            &mut library_references,
+                            &mut library_search_paths,
+                            &mut filtered_arguments,
+                        );
+                    }
                     library_references.push((
                         library_reference,
                         LibraryReferenceState {
@@ -542,6 +656,16 @@ fn parse_linker_arguments(
                     } else {
                         let library_reference = LibraryReference::FilePath(library_file_path);
                         let library_name = effective_library_name(&library_reference);
+                        if library_name.as_ref().map_or(false, |name| name == "c") {
+                            libhab_state = libhab_link(
+                                env,
+                                &current_linker_state,
+                                libhab_state,
+                                &mut library_references,
+                                &mut library_search_paths,
+                                &mut filtered_arguments,
+                            );
+                        }
                         library_references.push((
                             library_reference,
                             LibraryReferenceState {
@@ -565,16 +689,14 @@ fn parse_linker_arguments(
                 }
                 LDArgument::DynamicLinker(dynamic_linker_path, is_prefixed) => {
                     if let Some(env_dynamic_linker_path) = env.dynamic_linker.as_ref() {
-                        if dynamic_linker_path.is_impure_path(env) {
-                            skip_argument = true;
-                            if !is_prefixed {
-                                filtered_arguments.pop();
-                            }
-                            filtered_arguments.push(format!(
-                                "-dynamic-linker={}",
-                                env_dynamic_linker_path.display()
-                            ));
+                        skip_argument = true;
+                        if !is_prefixed {
+                            filtered_arguments.pop();
                         }
+                        filtered_arguments.push(format!(
+                            "-dynamic-linker={}",
+                            env_dynamic_linker_path.display()
+                        ));
                     } else {
                         if dynamic_linker_path.is_impure_path(env) {
                             skip_argument = true;
@@ -943,6 +1065,8 @@ fn parse_linker_arguments(
                 library_search_paths
             )
             .unwrap();
+            write!(&mut file, "libhab_path: {:?}\n", env.lib_hab_path).unwrap();
+            write!(&mut file, "libhab_state: {:?}\n", libhab_state).unwrap();
             write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
             write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
             write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
@@ -969,6 +1093,8 @@ fn parse_linker_arguments(
                 library_search_paths
             )
             .unwrap();
+            write!(&mut file, "libhab_path: {:?}\n", env.lib_hab_path).unwrap();
+            write!(&mut file, "libhab_state: {:?}\n", libhab_state).unwrap();
             write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
             write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
             write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
@@ -1178,7 +1304,6 @@ mod tests {
                 )
             );
         }
-
     }
 
     mod minimal_ld_link_mode {
@@ -2118,6 +2243,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
@@ -2165,6 +2291,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
@@ -2217,6 +2344,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
@@ -2284,13 +2412,14 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
             assert_eq!(result.join(" "), String::from(""));
 
-            // Pure dynamic linker is not replaced by specified linker
+            // Pure dynamic linker is replaced by specified linker
             let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
             let link_arguments = raw_link_arguments
                 .split(" ")
@@ -2301,14 +2430,18 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 dynamic_linker: Some(dynamic_linker_alternative.clone()),
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-            assert_eq!(result.join(" "), raw_link_arguments);
+            assert_eq!(
+                result.join(" "),
+                format!("-dynamic-linker={}", dynamic_linker_alternative.display())
+            );
 
-            // Pure dynamic linker is not replaced is alternative is not specified
+            // Pure dynamic linker is not replaced if alternative is not specified
             let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
             let link_arguments = raw_link_arguments
                 .split(" ")
@@ -2319,6 +2452,7 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
@@ -2352,6 +2486,306 @@ mod tests {
                     fs_root: temp_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
+    }
+
+    mod libhab_linking {
+        use super::touch;
+        use hab_pkg_wrappers::env::CommonEnvironment;
+        use tempdir::TempDir;
+
+        use crate::{parse_linker_arguments, LDEnvironment, LinkMode, WrappedLinkerName};
+
+        #[test]
+        fn static_libc_with_gnu_linker() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+            let libhab_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libhab")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libhabw_static = libc_search_path.join("libhabw.a");
+            touch(libhabw_static);
+
+            let raw_link_arguments =
+                format!("-static -lz -lc -L{} -lx", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::GNUBFD,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-static -lz --wrap=dlopen -lhabw -L {} -lc -L{} -lx",
+                    libhab_search_path.display(),
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn static_libc_with_other_linker() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+            let libhab_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libhab")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libhabw_static = libc_search_path.join("libhabw.a");
+            touch(libhabw_static);
+
+            let raw_link_arguments =
+                format!("-static -lz -lc -L{} -lx", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::Other,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+        }
+
+        #[test]
+        fn dynamic_libc_with_gnu_linker() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+            let libhab_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libhab")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libhabi_static = libhab_search_path.join("libhabi.a");
+            touch(libhabi_static);
+
+            let raw_link_arguments = format!("-lz -lc -L{} -lx", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::GNUBFD,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-lz -lhabi -L {} -lc -L{} -lx -rpath {}",
+                    libhab_search_path.display(),
+                    libc_search_path.display(),
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn dynamic_libc_with_other_linker() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+            let libhab_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libhab")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libhabi_static = libhab_search_path.join("libhabi.a");
+            touch(libhabi_static);
+
+            let raw_link_arguments = format!("-lz -lc -L{} -lx", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::Other,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                format!(
+                    "-lz -lhabi -L {} -lc -L{} -lx -rpath {}",
+                    libhab_search_path.display(),
+                    libc_search_path.display(),
+                    libc_search_path.display()
+                )
+            );
+        }
+
+        #[test]
+        fn no_libc() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+
+            let libhab_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("libhab")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libhabi_static = libhab_search_path.join("libhabi.a");
+            touch(libhabi_static);
+
+            // Dynamic linking
+            let raw_link_arguments = format!("-lz -lx");
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+
+            // No libc with GNU BFD linker
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::GNUBFD,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+
+            // No libc with other linker
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::Other,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+
+            // Static linking
+            let raw_link_arguments = format!("-Bstatic -lz -lx");
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+
+            // No libc with GNU BFD linker
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::GNUBFD,
+                lib_hab_path: Some(libhab_search_path.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ..Default::default()
+            };
+            let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
+            assert_eq!(result.join(" "), raw_link_arguments);
+
+            // No libc with other linker
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ld_name: WrappedLinkerName::Other,
+                lib_hab_path: Some(libhab_search_path.clone()),
                 ld_link_mode: LinkMode::Minimal,
                 ..Default::default()
             };
