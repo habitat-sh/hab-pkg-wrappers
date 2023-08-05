@@ -116,7 +116,7 @@ impl Default for LDEnvironment {
             prefix: std::env::var("PREFIX").ok().map(PathBuf::from),
             enforce_purity: std::env::var("HAB_ENFORCE_PURITY")
                 .map(|value| value == "1")
-                .unwrap_or(false),
+                .unwrap_or(true),
             tmp: std::env::var("TMP")
                 .map(PathBuf::from)
                 .unwrap_or(std::env::temp_dir()),
@@ -693,10 +693,20 @@ fn parse_linker_arguments(
                         if !is_prefixed {
                             filtered_arguments.pop();
                         }
-                        filtered_arguments.push(format!(
-                            "-dynamic-linker={}",
-                            env_dynamic_linker_path.display()
-                        ));
+                        // If the given linker is pure let it overwrite the original linker
+                        // This is important when using the current libc to compile a new glibc
+                        // All the binaries for the new glibc would use the new linker
+                        if !dynamic_linker_path.is_impure_path(env) {
+                            filtered_arguments.push(format!(
+                                "-dynamic-linker={}",
+                                dynamic_linker_path
+                            ));
+                        } else {
+                            filtered_arguments.push(format!(
+                                "-dynamic-linker={}",
+                                env_dynamic_linker_path.display()
+                            ));
+                        }
                     } else {
                         if dynamic_linker_path.is_impure_path(env) {
                             skip_argument = true;
@@ -2382,6 +2392,7 @@ mod tests {
                 .join("ld-linux-aarch64.so.1");
             touch(&impure_dynamic_linker);
 
+            // Impure dynamic linker does not override specified linker
             let raw_link_arguments = format!("-dynamic-linker {}", impure_dynamic_linker.display());
             let link_arguments = raw_link_arguments
                 .split(" ")
@@ -2420,8 +2431,8 @@ mod tests {
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
             assert_eq!(result.join(" "), String::from(""));
 
-            // Pure dynamic linker is replaced by specified linker
-            let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
+            // Pure dynamic linker replaces specified linker
+            let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker_alternative.display());
             let link_arguments = raw_link_arguments
                 .split(" ")
                 .map(|x| x.to_string())
@@ -2433,7 +2444,7 @@ mod tests {
                 },
                 enforce_purity: true,
                 ld_link_mode: LinkMode::Minimal,
-                dynamic_linker: Some(dynamic_linker_alternative.clone()),
+                dynamic_linker: Some(dynamic_linker.clone()),
                 ..Default::default()
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
@@ -2442,23 +2453,6 @@ mod tests {
                 format!("-dynamic-linker={}", dynamic_linker_alternative.display())
             );
 
-            // Pure dynamic linker is not replaced if alternative is not specified
-            let raw_link_arguments = format!("-dynamic-linker {}", dynamic_linker.display());
-            let link_arguments = raw_link_arguments
-                .split(" ")
-                .map(|x| x.to_string())
-                .collect::<Vec<String>>();
-            let env = LDEnvironment {
-                common: CommonEnvironment {
-                    fs_root: temp_dir.path().to_path_buf(),
-                    ..Default::default()
-                },
-                enforce_purity: true,
-                ld_link_mode: LinkMode::Minimal,
-                ..Default::default()
-            };
-            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-            assert_eq!(result.join(" "), raw_link_arguments);
         }
 
         #[test]
