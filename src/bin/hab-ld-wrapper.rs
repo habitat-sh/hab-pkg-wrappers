@@ -52,7 +52,7 @@ pub enum LinkMode {
 
 impl Default for LinkMode {
     fn default() -> Self {
-        LinkMode::Minimal
+        LinkMode::Complete
     }
 }
 

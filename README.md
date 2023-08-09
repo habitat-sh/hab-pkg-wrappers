@@ -23,7 +23,10 @@ An argument processor for parsing and managing arguments passed to the system li
 | HAB_DEBUG_LOG_FILE | Writes debug information to specified file instead of stderr. This prevents it from breaking certain autoconf checks |
 | HAB_DYNAMIC_LINKER | Specifies the dynamic linker to use when creating executables with shared libraries |
 | HAB_LD_RUN_PATH | A list of directories containing runtime libraries, separated by ':'; also serves as a hint for including rpath entries for `--as-needed` libraries |
-| HAB_ENFORCE_PURITY | Filters out all impure paths passed to the linker when set to '1' |
+| HAB_ENFORCE_PURITY | Filters out all impure paths passed to the linker when set to '1'. Default value is `1`. |
+| HAB_LD_LINK_MODE | Specifies the linker wrapper behavior. Possible values are: `complete` - adds all pkg_deps lib paths to the rpath of linked objects, `minimal` - adds lib paths of actually linked libraries to the rpath of linked objects |
+| HAB_WRAPPED_LINKER_NAME | The linker that is being wrapped. This is needed for certain linker specific behaviours. |
+| HAB_LIBHAB_PATH | The path to the `libhab` package which is used to enable [correct dynamic loading of libraries](https://github.com/habitat-sh/core-packages/issues/56) from habitat packages. If not specified, libhab will not be linked.  |
 | PREFIX | The installation folder for the current package being built |
 | TMP, TMPDIR, TEMP, TEMPDIR | Temporary directory folders |
 
