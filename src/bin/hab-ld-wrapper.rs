@@ -1,7 +1,5 @@
 use std::{
-    hash::Hash,
-    io::Write,
-    path::{Path, PathBuf},
+    fmt::Display, hash::Hash, io::Write, path::{Path, PathBuf}
 };
 
 use exec::Command;
@@ -20,6 +18,15 @@ pub enum LinkMode {
 impl Default for LinkMode {
     fn default() -> Self {
         LinkMode::Complete
+    }
+}
+
+impl Display for LinkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match  self {
+            LinkMode::Complete => write!(f, "complete"),
+            LinkMode::Minimal => write!(f, "minimal"),
+        }
     }
 }
 
@@ -231,6 +238,7 @@ enum LDArgument<'a> {
     LibraryFileName(&'a str, bool),
     LibraryFilePath(&'a str),
     RPath(&'a str, bool),
+    NoDynamicLinker,
     DynamicLinker(&'a str, bool),
     Output(&'a str, bool),
     SOName(&'a str, bool),
@@ -345,6 +353,8 @@ impl<'a> LDArgument<'a> {
                     true,
                 ))
             }
+            // No dynamic linker
+            (_, "--no-dynamic-linker") => Some(LDArgument::NoDynamicLinker),
             // Library Search Path arguments
             (Some("-L" | "-Y" | "-library-path" | "--library-path"), current_value) => {
                 Some(LDArgument::LibrarySearchPath(current_value, false))
@@ -456,6 +466,7 @@ impl<'a> LDArgument<'a> {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct LinkerState {
+    no_dynamic_linker: bool,
     is_static: bool,
     is_as_needed: bool,
     is_copy_dt_needed_entries: bool,
@@ -488,6 +499,7 @@ fn parse_linker_arguments(
     let mut additional_rpaths: Vec<PathBuf> = vec![];
     let mut library_references = Vec::new();
     let mut libraries_linked = Vec::new();
+    
 
     for argument in arguments {
         let mut skip_argument = false;
@@ -562,6 +574,9 @@ fn parse_linker_arguments(
                             rpaths.push(rpath);
                         }
                     }
+                }
+                LDArgument::NoDynamicLinker => {
+                    current_linker_state.no_dynamic_linker = true;
                 }
                 LDArgument::DynamicLinker(dynamic_linker_path, is_prefixed) => {
                     if let Some(env_dynamic_linker_path) = env.dynamic_linker.as_ref() {
@@ -922,10 +937,14 @@ fn parse_linker_arguments(
         }
     }
 
-    for additional_rpath in additional_rpaths.iter() {
-        filtered_arguments.push("-rpath".to_string());
-        filtered_arguments.push(additional_rpath.display().to_string());
+    // Only add addtional rpaths if there is a dynamic linker
+    if !current_linker_state.no_dynamic_linker {
+        for additional_rpath in additional_rpaths.iter() {
+            filtered_arguments.push("-rpath".to_string());
+            filtered_arguments.push(additional_rpath.display().to_string());
+        }
     }
+
 
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
@@ -937,6 +956,8 @@ fn parse_linker_arguments(
                 .expect("Failed to open debug output log file");
             write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
             write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
+            write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
+            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -963,6 +984,8 @@ fn parse_linker_arguments(
             let mut file = std::io::stderr().lock();
             write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
             write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
+            write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
+            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -1261,6 +1284,76 @@ mod tests {
             };
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
             assert_eq!(result.join(" "), raw_link_arguments);
+        }
+
+        // This is the scenario when creating static position independent executables.
+        // Theses links have a specific argument --no-dynamic-linker which indicates that they do not
+        // use a dynamic linker even though they are built like a relocatable library.
+        #[test]
+        fn complete_ld_link_mode_of_static_pie_executables() {
+            let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
+            let install_prefix_dir = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("openssl")
+                .join("version")
+                .join("release");
+            let install_lib_dir = install_prefix_dir.join("lib");
+            let libc_search_path = temp_dir
+                .path()
+                .join("hab")
+                .join("pkgs")
+                .join("core")
+                .join("glibc")
+                .join("version")
+                .join("release")
+                .join("lib");
+            let libc_static = libc_search_path.join("libc.a");
+            touch(libc_static);
+            let libc_shared = libc_search_path.join("libc.so");
+            touch(libc_shared);
+
+            let raw_link_arguments = format!("--no-dynamic-linker -Bstatic -lc -L {}", libc_search_path.display());
+            let link_arguments = raw_link_arguments
+                .split(" ")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                prefix: Some(install_prefix_dir.clone()),
+                ld_link_mode: LinkMode::Complete,
+                ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
+                ..Default::default()
+            };
+            // We verify no rpath is added with link mode minimal
+            let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                raw_link_arguments
+            );
+
+            let env = LDEnvironment {
+                common: CommonEnvironment {
+                    fs_root: temp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                prefix: Some(install_prefix_dir.clone()),
+                ld_link_mode: LinkMode::Minimal,
+                ld_run_path: vec![install_lib_dir.clone(), libc_search_path.clone()],
+                ..Default::default()
+            };
+            // We verify no rpath is added even with link mode complete
+            let result = parse_linker_arguments(link_arguments.into_iter(), &env);
+            assert_eq!(
+                result.join(" "),
+                raw_link_arguments
+            );
+
         }
 
         // This is the scenario when linking in libraries dynamically from other packages
