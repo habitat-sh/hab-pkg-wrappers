@@ -1104,6 +1104,16 @@ mod tests {
         }
         std::fs::File::create(path).unwrap();
     }
+    fn shared_lib_name(name: impl AsRef<str>) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            return format!("lib{}.dylib", name.as_ref())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return format!("lib{}.so", name.as_ref())
+        }
+    }
 
     mod complete_ld_link_mode {
         use hab_pkg_wrappers::env::CommonEnvironment;
@@ -1111,7 +1121,7 @@ mod tests {
 
         use crate::{parse_linker_arguments, LDEnvironment};
 
-        use super::touch;
+        use super::{touch, shared_lib_name};
 
         // This scenario checks that whatever directory is present in the LD_RUN_PATH will be added
         // as an rpath argument regardless of if the library path is provided to the linker and regardless
@@ -1129,7 +1139,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
             let libx_search_path = temp_dir
                 .path()
@@ -1140,7 +1150,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libx_shared = libx_search_path.join("libx.so");
+            let libx_shared = libx_search_path.join(shared_lib_name("x"));
             touch(libx_shared);
             let libz_search_path = temp_dir
                 .path()
@@ -1151,7 +1161,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libz_shared = libz_search_path.join("libz.so");
+            let libz_shared = libz_search_path.join(shared_lib_name("z"));
             touch(libz_shared);
             let libm_search_path = temp_dir
                 .path()
@@ -1205,7 +1215,7 @@ mod tests {
     }
 
     mod minimal_ld_link_mode {
-        use super::touch;
+        use super::{touch, shared_lib_name};
         use hab_pkg_wrappers::env::CommonEnvironment;
         use tempdir::TempDir;
 
@@ -1225,7 +1235,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
@@ -1312,7 +1322,7 @@ mod tests {
                 .join("lib");
             let libc_static = libc_search_path.join("libc.a");
             touch(libc_static);
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("--no-dynamic-linker -Bstatic -lc -L {}", libc_search_path.display());
@@ -1373,7 +1383,7 @@ mod tests {
                 .join("lib");
             let libc_static = libc_search_path.join("libc.a");
             touch(libc_static);
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-lc -L {}", libc_search_path.display());
@@ -1417,7 +1427,7 @@ mod tests {
                 .join("lib");
             let libc_static = libc_search_path.join("libc.a");
             touch(libc_static);
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-Bstatic -lc -L {}", libc_search_path.display());
@@ -1449,7 +1459,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-lc -L {0} -rpath {0}", libc_search_path.display());
@@ -1481,7 +1491,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-lc -L {}/../lib", libc_search_path.display());
@@ -1520,7 +1530,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!(
@@ -1562,7 +1572,7 @@ mod tests {
                 .join("cache")
                 .join("src")
                 .join("openssl");
-            let libcrypto_shared = build_dir.join("libcrypto.so");
+            let libcrypto_shared = build_dir.join(shared_lib_name("crypto"));
             touch(&libcrypto_shared);
 
             // Passed as -l flag
@@ -1661,7 +1671,7 @@ mod tests {
                 .join("glibc")
                 .join("old-version")
                 .join("release");
-            let old_libc_shared = old_install_prefix_dir.join("libc.so");
+            let old_libc_shared = old_install_prefix_dir.join(shared_lib_name("c"));
             touch(&old_libc_shared);
 
             let install_prefix_dir = temp_dir
@@ -1678,7 +1688,7 @@ mod tests {
                 .join("cache")
                 .join("src")
                 .join("glibc");
-            let new_libc_shared = build_dir.join("libc.so");
+            let new_libc_shared = build_dir.join(shared_lib_name("c"));
             touch(&new_libc_shared);
 
             // New library passed via build search path
@@ -1838,7 +1848,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libstdcxx_shared = libstdcxx_search_path.join("libstdc++.so");
+            let libstdcxx_shared = libstdcxx_search_path.join(shared_lib_name("stdc++"));
             touch(&libstdcxx_shared);
             let libstdcxx_libs_search_path = temp_dir
                 .path()
@@ -1849,7 +1859,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libstdcxx_libs_shared = libstdcxx_libs_search_path.join("libstdc++.so");
+            let libstdcxx_libs_shared = libstdcxx_libs_search_path.join(shared_lib_name("stdc++"));
             touch(&libstdcxx_libs_shared);
 
             // This is the case where gcc and gcc-libs are only a build dep
@@ -1967,7 +1977,7 @@ mod tests {
                 .join("lib");
             let libc_static = libc_search_path.join("libc.a");
             touch(libc_static);
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
@@ -2012,7 +2022,7 @@ mod tests {
                 .join("lib");
             let libc_static = libc_search_path.join("libc.a");
             touch(libc_static);
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("--as-needed -lc -L {}", libc_search_path.display());
@@ -2062,7 +2072,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(&libc_shared);
             let libz_search_path = temp_dir
                 .path()
@@ -2073,7 +2083,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libz_shared = libz_search_path.join("libz.so");
+            let libz_shared = libz_search_path.join(shared_lib_name("z"));
             touch(&libz_shared);
 
             // without ld run path hint
@@ -2149,7 +2159,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(&libc_shared);
             let libz_search_path = temp_dir
                 .path()
@@ -2160,7 +2170,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libz_shared = libz_search_path.join("libz.so");
+            let libz_shared = libz_search_path.join(shared_lib_name("z"));
             let libz_static = libz_search_path.join("libz.a");
             touch(&libz_shared);
             touch(&libz_static);
@@ -2198,7 +2208,7 @@ mod tests {
         fn impure_library_search_path_filtering() {
             let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
             let libc_search_path = temp_dir.path().join("usr").join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments = format!("-lc -L {0} -L{0} -L{0}/../../usr/lib -L {0}/../../usr/lib -L{0}/../../hab/pkgs/core/glibc/version/release/lib -lm", libc_search_path.display());
@@ -2228,7 +2238,7 @@ mod tests {
         fn impure_absolute_library_path_filtering() {
             let temp_dir = TempDir::new("ld-wrapper-test").unwrap();
             let impure_libz_search_path = temp_dir.path().join("usr").join("lib");
-            let impure_libz_shared = impure_libz_search_path.join("libz.so");
+            let impure_libz_shared = impure_libz_search_path.join(shared_lib_name("z"));
             touch(&impure_libz_shared);
 
             let libc_search_path = temp_dir
@@ -2240,7 +2250,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(&libc_shared);
 
             let raw_link_arguments = format!(
@@ -2431,7 +2441,7 @@ mod tests {
                 .join("version")
                 .join("release")
                 .join("lib");
-            let libc_shared = libc_search_path.join("libc.so");
+            let libc_shared = libc_search_path.join(shared_lib_name("c"));
             touch(libc_shared);
 
             let raw_link_arguments =
