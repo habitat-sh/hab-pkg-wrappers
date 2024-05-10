@@ -22,22 +22,22 @@ impl Default for CCEnvironment {
             executable_name: std::env::var("HAB_CC_EXECUTABLE_NAME").unwrap_or_default(),
             ld_bin: std::env::var("HAB_LD_BIN").map(PathBuf::from).ok(),
             c_start_files: std::env::var("HAB_C_START_FILES")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             c_std_libs: std::env::var("HAB_C_STD_LIBS")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             c_std_headers: std::env::var("HAB_C_STD_HEADERS")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             cxx_std_libs: std::env::var("HAB_CXX_STD_LIBS")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             cxx_std_headers: std::env::var("HAB_CXX_STD_HEADERS")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
             framework_dirs: std::env::var("HAB_FRAMEWORK_DIRS")
-                .map(|p| p.split(":").map(PathBuf::from).collect::<Vec<_>>())
+                .map(|p| p.split(':').map(PathBuf::from).collect::<Vec<_>>())
                 .unwrap_or_default(),
         }
     }
@@ -136,34 +136,33 @@ fn parse_cc_arguments(arguments: impl Iterator<Item = String>, env: &CCEnvironme
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .create(true)
                 .open(debug_log_file)
                 .expect("Failed to open debug output log file");
-            write!(&mut file, "is_cxx: {}\n", is_cxx).unwrap();
-            write!(&mut file, "add_start_files: {}\n", add_start_files).unwrap();
-            write!(&mut file, "add_c_std_libs: {}\n", add_c_std_libs).unwrap();
-            write!(&mut file, "add_c_std_headers: {}\n", add_c_std_headers).unwrap();
-            write!(&mut file, "add_cxx_std_libs: {}\n", add_cxx_std_libs).unwrap();
-            write!(&mut file, "add_cxx_std_headers: {}\n", add_cxx_std_headers).unwrap();
-            write!(
+            writeln!(&mut file, "is_cxx: {}", is_cxx).unwrap();
+            writeln!(&mut file, "add_start_files: {}", add_start_files).unwrap();
+            writeln!(&mut file, "add_c_std_libs: {}", add_c_std_libs).unwrap();
+            writeln!(&mut file, "add_c_std_headers: {}", add_c_std_headers).unwrap();
+            writeln!(&mut file, "add_cxx_std_libs: {}", add_cxx_std_libs).unwrap();
+            writeln!(&mut file, "add_cxx_std_headers: {}", add_cxx_std_headers).unwrap();
+            writeln!(
                 &mut file,
-                "filtered_cc_arguments: {:#?}\n",
+                "filtered_cc_arguments: {:#?}",
                 filtered_arguments
             )
             .unwrap();
         } else {
             let mut file = std::io::stderr().lock();
-            write!(&mut file, "is_cxx: {}\n", is_cxx).unwrap();
-            write!(&mut file, "add_start_files: {}\n", add_start_files).unwrap();
-            write!(&mut file, "add_c_std_libs: {}\n", add_c_std_libs).unwrap();
-            write!(&mut file, "add_c_std_headers: {}\n", add_c_std_headers).unwrap();
-            write!(&mut file, "add_cxx_std_libs: {}\n", add_cxx_std_libs).unwrap();
-            write!(&mut file, "add_cxx_std_headers: {}\n", add_cxx_std_headers).unwrap();
-            write!(
+            writeln!(&mut file, "is_cxx: {}", is_cxx).unwrap();
+            writeln!(&mut file, "add_start_files: {}", add_start_files).unwrap();
+            writeln!(&mut file, "add_c_std_libs: {}", add_c_std_libs).unwrap();
+            writeln!(&mut file, "add_c_std_headers: {}", add_c_std_headers).unwrap();
+            writeln!(&mut file, "add_cxx_std_libs: {}", add_cxx_std_libs).unwrap();
+            writeln!(&mut file, "add_cxx_std_headers: {}", add_cxx_std_headers).unwrap();
+            writeln!(
                 &mut file,
-                "filtered_cc_arguments: {:#?}\n",
+                "filtered_cc_arguments: {:#?}",
                 filtered_arguments
             )
             .unwrap();
@@ -185,8 +184,7 @@ fn main() {
             } else {
                 vec![argument]
             }
-        })
-        .into_iter(),
+        }),
         &env,
     );
 
@@ -195,47 +193,46 @@ fn main() {
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .create(true)
                 .open(debug_log_file)
                 .expect("Failed to open debug output log file");
-            write!(
+            writeln!(
                 &mut file,
-                "work_dir: {} \n",
+                "work_dir: {}",
                 std::env::current_dir().unwrap().display()
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "original: {}\n",
+                "original: {}",
                 std::env::args().skip(1).collect::<Vec<String>>().join(" ")
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "wrapped: {} {}\n",
+                "wrapped: {} {}",
                 program,
                 parsed_arguments.join(" ")
             )
             .unwrap();
         } else {
             let mut file = std::io::stderr().lock();
-            write!(
+            writeln!(
                 &mut file,
-                "work_dir: {} \n",
+                "work_dir: {}",
                 std::env::current_dir().unwrap().display()
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "original: {}\n",
+                "original: {}",
                 std::env::args().skip(1).collect::<Vec<String>>().join(" ")
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "wrapped: {} {}\n",
+                "wrapped: {} {}",
                 program,
                 parsed_arguments.join(" ")
             )

@@ -1,29 +1,27 @@
 use std::{
-    fmt::Display, hash::Hash, io::Write, path::{Path, PathBuf}
+    fmt::Display,
+    hash::Hash,
+    io::Write,
+    path::{Path, PathBuf},
 };
 
 use exec::Command;
 use hab_pkg_wrappers::{env::CommonEnvironment, opts_parser, util::PrefixedArg};
 use path_absolutize::Absolutize;
 
-#[derive(Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 pub enum LinkMode {
     /// Ensures every path in the LD_RUN_PATH environment variable is added to the rpath of binaries
+    #[default]
     Complete,
     /// Adds paths in the LD_RUN_PATH environment variable to the rpath of binaries only
     /// if the path actually contains a linked library
     Minimal,
 }
 
-impl Default for LinkMode {
-    fn default() -> Self {
-        LinkMode::Complete
-    }
-}
-
 impl Display for LinkMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match  self {
+        match self {
             LinkMode::Complete => write!(f, "complete"),
             LinkMode::Minimal => write!(f, "minimal"),
         }
@@ -62,7 +60,7 @@ impl Default for LDEnvironment {
             allowed_impure_paths: std::env::var("HAB_ALLOWED_IMPURE_PATHS")
                 .map(|value| {
                     value
-                        .split(":")
+                        .split(':')
                         .map(PathBuf::from)
                         .collect::<Vec<PathBuf>>()
                 })
@@ -74,7 +72,7 @@ impl Default for LDEnvironment {
             ld_run_path: std::env::var("HAB_LD_RUN_PATH")
                 .map(|value| {
                     value
-                        .split(":")
+                        .split(':')
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from)
                         .collect::<Vec<PathBuf>>()
@@ -134,29 +132,29 @@ where
             || path.starts_with(
                 env.common
                     .fs_root
-                    .join(&env.tmp.components().skip(1).collect::<PathBuf>()),
+                    .join(env.tmp.components().skip(1).collect::<PathBuf>()),
             )
             || path.starts_with(
                 env.common
                     .fs_root
-                    .join(&env.tmpdir.components().skip(1).collect::<PathBuf>()),
+                    .join(env.tmpdir.components().skip(1).collect::<PathBuf>()),
             )
             || path.starts_with(
                 env.common
                     .fs_root
-                    .join(&env.temp.components().skip(1).collect::<PathBuf>()),
+                    .join(env.temp.components().skip(1).collect::<PathBuf>()),
             )
             || path.starts_with(
                 env.common
                     .fs_root
-                    .join(&env.tempdir.components().skip(1).collect::<PathBuf>()),
+                    .join(env.tempdir.components().skip(1).collect::<PathBuf>()),
             ))
     }
 
     fn is_allowed_impure_path(&self, env: &LDEnvironment) -> bool {
         let path = self.as_ref();
         for dir in env.allowed_impure_paths.iter() {
-            if path.starts_with(&dir) {
+            if path.starts_with(dir) {
                 return true;
             }
         }
@@ -189,7 +187,7 @@ where
     }
 
     fn is_static_library(&self) -> bool {
-        self.as_ref().ends_with(".a")
+        self.as_ref().extension().is_some_and(|ext| ext == "a")
     }
 }
 
@@ -232,17 +230,23 @@ struct LibraryLinkState {
 
 #[derive(Debug)]
 enum LDArgument<'a> {
+    #[allow(dead_code)]
     LinkArgsFile(&'a str),
     LibrarySearchPath(&'a str, bool),
+    #[allow(dead_code)]
     LibraryName(&'a str, bool),
+    #[allow(dead_code)]
     LibraryFileName(&'a str, bool),
     LibraryFilePath(&'a str),
     RPath(&'a str, bool),
     NoDynamicLinker,
     DynamicLinker(&'a str, bool),
+    #[allow(dead_code)]
     Output(&'a str, bool),
+    #[allow(dead_code)]
     SOName(&'a str, bool),
     Plugin(&'a str, bool),
+    #[allow(dead_code)]
     PluginOpt(&'a str, bool),
     LinkStatic,
     LinkDynamic,
@@ -286,7 +290,7 @@ impl<'a> LDArgument<'a> {
             }
             // File with linker arguments
             (_, current_value) if current_value.is_prefixed_with("@") => Some(
-                LDArgument::LinkArgsFile(current_value.strip_prefix("@").unwrap()),
+                LDArgument::LinkArgsFile(current_value.strip_prefix('@').unwrap()),
             ),
             // Output argument, the single dash form of '-output' is not allowed.
             // If the argument is '-output' it is recognized as '--output utput'
@@ -424,7 +428,7 @@ impl<'a> LDArgument<'a> {
             (Some("-l" | "-library" | "--library"), current_value) => {
                 if current_value.is_prefixed_with(":") {
                     Some(LDArgument::LibraryFileName(
-                        current_value.strip_prefix(":").unwrap(),
+                        current_value.strip_prefix(':').unwrap(),
                         false,
                     ))
                 } else {
@@ -480,7 +484,7 @@ fn effective_library_name(library_reference: &LibraryReference) -> Option<String
             .file_name()
             .and_then(|file_name| file_name.to_str())
             .and_then(|file_name| file_name.strip_prefix("lib"))
-            .and_then(|file_name| file_name.split_once("."))
+            .and_then(|file_name| file_name.split_once('.'))
             .map(|(library_name, _)| library_name.to_string()),
     }
 }
@@ -499,14 +503,11 @@ fn parse_linker_arguments(
     let mut additional_rpaths: Vec<PathBuf> = vec![];
     let mut library_references = Vec::new();
     let mut libraries_linked = Vec::new();
-    
 
     for argument in arguments {
         let mut skip_argument = false;
         let mut skip_prev_argument = false;
-        if let Some(known_argument) =
-            LDArgument::parse(previous_argument.as_ref().map(|x| x.as_str()), &argument)
-        {
+        if let Some(known_argument) = LDArgument::parse(previous_argument.as_deref(), &argument) {
             match known_argument {
                 LDArgument::Output(_, _) | LDArgument::SOName(_, _) => {
                     // Nothing to do for these arguments
@@ -591,6 +592,7 @@ fn parse_linker_arguments(
                             ));
                         }
                     } else {
+                        #[allow(clippy::collapsible_else_if)]
                         if dynamic_linker_path.is_impure_path(env) {
                             skip_argument = true;
                             skip_prev_argument = !is_prefixed;
@@ -632,7 +634,7 @@ fn parse_linker_arguments(
                     current_linker_state.is_copy_dt_needed_entries = false;
                 }
                 LDArgument::PushState => {
-                    linker_state_stack.push(current_linker_state.clone());
+                    linker_state_stack.push(current_linker_state);
                     current_linker_state = LinkerState::default();
                 }
                 LDArgument::PopState => {
@@ -703,7 +705,7 @@ fn parse_linker_arguments(
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: env
                                     .ld_run_path
-                                    .contains(&library_search_path),
+                                    .contains(library_search_path),
                             });
                         } else {
                             let library_file_path =
@@ -739,10 +741,11 @@ fn parse_linker_arguments(
                                 is_pkg_path: library_file_path.is_pkg_path(env),
                                 is_available_at_runtime: env
                                     .ld_run_path
-                                    .contains(&library_search_path),
+                                    .contains(library_search_path),
                             });
                         }
                     } else if library_file_path.is_static_library() {
+                        #[allow(clippy::collapsible_else_if)]
                         if library_file_path.is_file() {
                             library_state.results.push(LibraryLinkResult {
                                 link_type: LibraryLinkType::StaticLibraryLinked,
@@ -785,6 +788,7 @@ fn parse_linker_arguments(
                             });
                         }
                     } else if library_file_path.is_static_library() {
+                        #[allow(clippy::collapsible_else_if)]
                         if library_file_path.is_file() {
                             library_state.results.push(LibraryLinkResult {
                                 link_type: LibraryLinkType::StaticLibraryLinked,
@@ -868,6 +872,7 @@ fn parse_linker_arguments(
                 }
 
                 if library_will_link && library_is_needed {
+                    #[allow(clippy::if_same_then_else)]
                     if final_link_result.is_none() {
                         final_link_result = Some(result.clone());
                     } else if library_is_available_at_runtime {
@@ -920,8 +925,9 @@ fn parse_linker_arguments(
     if !all_needed_libraries_will_link {
         if let Some(prefix) = env.prefix.as_ref() {
             for run_path in env.ld_run_path.iter() {
+                #[allow(clippy::collapsible_if)]
                 if run_path.starts_with(prefix) {
-                    if !rpaths.contains(&run_path) && !additional_rpaths.contains(&run_path) {
+                    if !rpaths.contains(run_path) && !additional_rpaths.contains(run_path) {
                         additional_rpaths.push(run_path.clone())
                     }
                 }
@@ -931,7 +937,7 @@ fn parse_linker_arguments(
     // Ensure all paths in the LD_RUN_PATH are added to the rpath
     if env.ld_link_mode == LinkMode::Complete {
         for search_dir in env.ld_run_path.iter() {
-            if !rpaths.contains(&search_dir) && !additional_rpaths.contains(&search_dir) {
+            if !rpaths.contains(search_dir) && !additional_rpaths.contains(search_dir) {
                 additional_rpaths.push(search_dir.clone())
             }
         }
@@ -945,66 +951,74 @@ fn parse_linker_arguments(
         }
     }
 
-
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .create(true)
                 .open(debug_log_file)
                 .expect("Failed to open debug output log file");
-            write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
-            write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
-            write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
-            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
-            write!(
+            writeln!(&mut file, "prefix: {:?}", env.prefix).unwrap();
+            writeln!(&mut file, "ld_run_path: {:#?}", env.ld_run_path).unwrap();
+            writeln!(&mut file, "ld_link_mode: {}", env.ld_link_mode).unwrap();
+            writeln!(
                 &mut file,
-                "library_search_paths: {:#?}\n",
+                "no_dynamic_linker: {}",
+                current_linker_state.no_dynamic_linker
+            )
+            .unwrap();
+            writeln!(
+                &mut file,
+                "library_search_paths: {:#?}",
                 library_search_paths
             )
             .unwrap();
-            write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
-            write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
-            write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
-            write!(&mut file, "libraries_linked: {:#?}\n", libraries_linked).unwrap();
-            write!(
+            writeln!(&mut file, "library_references: {:#?}", library_references).unwrap();
+            writeln!(&mut file, "rpaths: {:#?}", rpaths).unwrap();
+            writeln!(&mut file, "additional_rpaths: {:#?}", additional_rpaths).unwrap();
+            writeln!(&mut file, "libraries_linked: {:#?}", libraries_linked).unwrap();
+            writeln!(
                 &mut file,
-                "all_needed_libraries_will_link: {}\n",
+                "all_needed_libraries_will_link: {}",
                 all_needed_libraries_will_link
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "filtered_ld_arguments: {:#?}\n",
+                "filtered_ld_arguments: {:#?}",
                 filtered_arguments
             )
             .unwrap();
         } else {
             let mut file = std::io::stderr().lock();
-            write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
-            write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
-            write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
-            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
-            write!(
+            writeln!(&mut file, "prefix: {:?}", env.prefix).unwrap();
+            writeln!(&mut file, "ld_run_path: {:#?}", env.ld_run_path).unwrap();
+            writeln!(&mut file, "ld_link_mode: {}", env.ld_link_mode).unwrap();
+            writeln!(
                 &mut file,
-                "library_search_paths: {:#?}\n",
+                "no_dynamic_linker: {}",
+                current_linker_state.no_dynamic_linker
+            )
+            .unwrap();
+            writeln!(
+                &mut file,
+                "library_search_paths: {:#?}",
                 library_search_paths
             )
             .unwrap();
-            write!(&mut file, "library_references: {:#?}\n", library_references).unwrap();
-            write!(&mut file, "rpaths: {:#?}\n", rpaths).unwrap();
-            write!(&mut file, "additional_rpaths: {:#?}\n", additional_rpaths).unwrap();
-            write!(&mut file, "libraries_linked: {:#?}\n", libraries_linked).unwrap();
-            write!(
+            writeln!(&mut file, "library_references: {:#?}", library_references).unwrap();
+            writeln!(&mut file, "rpaths: {:#?}", rpaths).unwrap();
+            writeln!(&mut file, "additional_rpaths: {:#?}", additional_rpaths).unwrap();
+            writeln!(&mut file, "libraries_linked: {:#?}", libraries_linked).unwrap();
+            writeln!(
                 &mut file,
-                "all_needed_libraries_will_link: {}\n",
+                "all_needed_libraries_will_link: {}",
                 all_needed_libraries_will_link
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "filtered_ld_arguments: {:#?}\n",
+                "filtered_ld_arguments: {:#?}",
                 filtered_arguments
             )
             .unwrap();
@@ -1026,8 +1040,7 @@ fn main() {
             } else {
                 vec![argument]
             }
-        })
-        .into_iter(),
+        }),
         &env,
     );
 
@@ -1040,47 +1053,46 @@ fn main() {
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .create(true)
                 .open(debug_log_file)
                 .expect("Failed to open debug output log file");
-            write!(
+            writeln!(
                 &mut file,
-                "work_dir: {}\n",
+                "work_dir: {}",
                 std::env::current_dir().unwrap().display()
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "original: {}\n",
+                "original: {}",
                 std::env::args().skip(1).collect::<Vec<String>>().join(" ")
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "wrapped: {} {}\n",
+                "wrapped: {} {}",
                 program,
                 parsed_arguments.join(" ")
             )
             .unwrap();
         } else {
             let mut file = std::io::stderr().lock();
-            write!(
+            writeln!(
                 &mut file,
-                "work_dir: {}\n",
+                "work_dir: {}",
                 std::env::current_dir().unwrap().display()
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "original: {}\n",
+                "original: {}",
                 std::env::args().skip(1).collect::<Vec<String>>().join(" ")
             )
             .unwrap();
-            write!(
+            writeln!(
                 &mut file,
-                "wrapped: {} {}\n",
+                "wrapped: {} {}",
                 program,
                 parsed_arguments.join(" ")
             )
@@ -1201,7 +1213,6 @@ mod tests {
                 )
             );
         }
-
     }
 
     mod minimal_ld_link_mode {
@@ -1315,7 +1326,10 @@ mod tests {
             let libc_shared = libc_search_path.join("libc.so");
             touch(libc_shared);
 
-            let raw_link_arguments = format!("--no-dynamic-linker -Bstatic -lc -L {}", libc_search_path.display());
+            let raw_link_arguments = format!(
+                "--no-dynamic-linker -Bstatic -lc -L {}",
+                libc_search_path.display()
+            );
             let link_arguments = raw_link_arguments
                 .split(" ")
                 .map(|x| x.to_string())
@@ -1332,10 +1346,7 @@ mod tests {
             };
             // We verify no rpath is added with link mode minimal
             let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
-            assert_eq!(
-                result.join(" "),
-                raw_link_arguments
-            );
+            assert_eq!(result.join(" "), raw_link_arguments);
 
             let env = LDEnvironment {
                 common: CommonEnvironment {
@@ -1349,11 +1360,7 @@ mod tests {
             };
             // We verify no rpath is added even with link mode complete
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-            assert_eq!(
-                result.join(" "),
-                raw_link_arguments
-            );
-
+            assert_eq!(result.join(" "), raw_link_arguments);
         }
 
         // This is the scenario when linking in libraries dynamically from other packages
