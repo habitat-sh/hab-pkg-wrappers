@@ -1,5 +1,8 @@
 use std::{
-    fmt::Display, hash::Hash, io::Write, path::{Path, PathBuf}
+    fmt::Display,
+    hash::Hash,
+    io::Write,
+    path::{Path, PathBuf},
 };
 
 use exec::Command;
@@ -23,7 +26,7 @@ impl Default for LinkMode {
 
 impl Display for LinkMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match  self {
+        match self {
             LinkMode::Complete => write!(f, "complete"),
             LinkMode::Minimal => write!(f, "minimal"),
         }
@@ -499,7 +502,6 @@ fn parse_linker_arguments(
     let mut additional_rpaths: Vec<PathBuf> = vec![];
     let mut library_references = Vec::new();
     let mut libraries_linked = Vec::new();
-    
 
     for argument in arguments {
         let mut skip_argument = false;
@@ -945,7 +947,6 @@ fn parse_linker_arguments(
         }
     }
 
-
     if env.common.is_debug {
         if let Some(debug_log_file) = env.common.debug_log_file.as_ref() {
             let mut file = std::fs::OpenOptions::new()
@@ -957,7 +958,11 @@ fn parse_linker_arguments(
             write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
             write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
             write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
-            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
+            write!(
+                &mut file,
+                "no_dynamic_linker: {}\n",
+                current_linker_state.no_dynamic_linker
+            );
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -985,7 +990,11 @@ fn parse_linker_arguments(
             write!(&mut file, "prefix: {:?}\n", env.prefix).unwrap();
             write!(&mut file, "ld_run_path: {:#?}\n", env.ld_run_path).unwrap();
             write!(&mut file, "ld_link_mode: {}\n", env.ld_link_mode);
-            write!(&mut file, "no_dynamic_linker: {}\n", current_linker_state.no_dynamic_linker);
+            write!(
+                &mut file,
+                "no_dynamic_linker: {}\n",
+                current_linker_state.no_dynamic_linker
+            );
             write!(
                 &mut file,
                 "library_search_paths: {:#?}\n",
@@ -1201,7 +1210,6 @@ mod tests {
                 )
             );
         }
-
     }
 
     mod minimal_ld_link_mode {
@@ -1315,7 +1323,10 @@ mod tests {
             let libc_shared = libc_search_path.join("libc.so");
             touch(libc_shared);
 
-            let raw_link_arguments = format!("--no-dynamic-linker -Bstatic -lc -L {}", libc_search_path.display());
+            let raw_link_arguments = format!(
+                "--no-dynamic-linker -Bstatic -lc -L {}",
+                libc_search_path.display()
+            );
             let link_arguments = raw_link_arguments
                 .split(" ")
                 .map(|x| x.to_string())
@@ -1332,10 +1343,7 @@ mod tests {
             };
             // We verify no rpath is added with link mode minimal
             let result = parse_linker_arguments(link_arguments.clone().into_iter(), &env);
-            assert_eq!(
-                result.join(" "),
-                raw_link_arguments
-            );
+            assert_eq!(result.join(" "), raw_link_arguments);
 
             let env = LDEnvironment {
                 common: CommonEnvironment {
@@ -1349,11 +1357,7 @@ mod tests {
             };
             // We verify no rpath is added even with link mode complete
             let result = parse_linker_arguments(link_arguments.into_iter(), &env);
-            assert_eq!(
-                result.join(" "),
-                raw_link_arguments
-            );
-
+            assert_eq!(result.join(" "), raw_link_arguments);
         }
 
         // This is the scenario when linking in libraries dynamically from other packages
