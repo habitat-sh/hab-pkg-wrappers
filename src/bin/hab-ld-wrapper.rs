@@ -507,9 +507,7 @@ fn parse_linker_arguments(
     for argument in arguments {
         let mut skip_argument = false;
         let mut skip_prev_argument = false;
-        if let Some(known_argument) =
-            LDArgument::parse(previous_argument.as_deref(), &argument)
-        {
+        if let Some(known_argument) = LDArgument::parse(previous_argument.as_deref(), &argument) {
             match known_argument {
                 LDArgument::Output(_, _) | LDArgument::SOName(_, _) => {
                     // Nothing to do for these arguments
@@ -967,7 +965,8 @@ fn parse_linker_arguments(
                 &mut file,
                 "no_dynamic_linker: {}",
                 current_linker_state.no_dynamic_linker
-            ).unwrap();
+            )
+            .unwrap();
             writeln!(
                 &mut file,
                 "library_search_paths: {:#?}",
@@ -999,7 +998,8 @@ fn parse_linker_arguments(
                 &mut file,
                 "no_dynamic_linker: {}",
                 current_linker_state.no_dynamic_linker
-            ).unwrap();
+            )
+            .unwrap();
             writeln!(
                 &mut file,
                 "library_search_paths: {:#?}",
