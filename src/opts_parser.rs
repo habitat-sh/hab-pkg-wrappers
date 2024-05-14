@@ -82,7 +82,7 @@ pub fn expand_argument(argument: &str, env: &CommonEnvironment) -> Vec<String> {
     if !argument.is_prefixed_with("@") {
         return vec![argument.to_string()];
     }
-    let file = PathBuf::from(argument.strip_prefix("@").unwrap())
+    let file = PathBuf::from(argument.strip_prefix('@').unwrap())
         .absolutize_from(&env.cwd)
         .unwrap()
         .to_path_buf();
@@ -104,7 +104,7 @@ pub fn expand_argument(argument: &str, env: &CommonEnvironment) -> Vec<String> {
             let final_argument = current_argument.clone().into_iter().collect::<String>();
             current_argument.truncate(0);
             let final_expanded_argument = expand_argument(&final_argument, env);
-            expanded_arguments.extend(final_expanded_argument.into_iter());
+            expanded_arguments.extend(final_expanded_argument);
         } else if current_state == State::UnquotedEscape
             || current_state == State::SingleQuoteEscape
             || current_state == State::DoubleQuoteEscape
@@ -118,7 +118,7 @@ pub fn expand_argument(argument: &str, env: &CommonEnvironment) -> Vec<String> {
     if current_state != State::Outside {
         let final_argument = current_argument.clone().into_iter().collect::<String>();
         let final_expanded_argument = expand_argument(&final_argument, env);
-        expanded_arguments.extend(final_expanded_argument.into_iter());
+        expanded_arguments.extend(final_expanded_argument);
     }
     expanded_arguments
 }
