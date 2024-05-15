@@ -24,6 +24,7 @@ jobs:
       - run: >-
           rustup toolchain install ${{matrix.toolchain }} &&
           rustup component add rustfmt --toolchain ${{matrix.toolchain }} &&
+          rustup component add clippy --toolchain ${{matrix.toolchain }} &&
           rustup default ${{matrix.toolchain }}
 
       - name: Check for Format Errors
