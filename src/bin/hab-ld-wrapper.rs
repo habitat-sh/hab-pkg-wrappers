@@ -1119,11 +1119,11 @@ mod tests {
     fn shared_lib_name(name: impl AsRef<str>) -> String {
         #[cfg(target_os = "macos")]
         {
-            return format!("lib{}.dylib", name.as_ref())
+            return format!("lib{}.dylib", name.as_ref());
         }
         #[cfg(target_os = "linux")]
         {
-            return format!("lib{}.so", name.as_ref())
+            return format!("lib{}.so", name.as_ref());
         }
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
 
         use crate::{parse_linker_arguments, LDEnvironment};
 
-        use super::{touch, shared_lib_name};
+        use super::{shared_lib_name, touch};
 
         // This scenario checks that whatever directory is present in the LD_RUN_PATH will be added
         // as an rpath argument regardless of if the library path is provided to the linker and regardless
@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     mod minimal_ld_link_mode {
-        use super::{touch, shared_lib_name};
+        use super::{shared_lib_name, touch};
         use hab_pkg_wrappers::env::CommonEnvironment;
         use tempdir::TempDir;
 
