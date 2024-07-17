@@ -13,11 +13,16 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        toolchain:
+        os: [ubuntu-latest, macos-latest]
+        architecture: [x64, arm64]
+        toolchain: 
           - 1.75.0
+        exclude:
+          - os: macos-latest
+            architecture: x64
 
     steps:
       - uses: actions/checkout@v4
