@@ -51,3 +51,7 @@ An argument processor for parsing and managing arguments passed to the C compile
 | HAB_CXX_STD_HEADERS | A list of C++ standard header directories, separated by ':' |
 
 By configuring these environment variables, you can easily customize the behavior of the `hab-cc-wrapper` to suit your habitat package's requirements.
+
+# Copyright
+
+See [COPYRIGHT.md](./COPYRIGHT.md).
