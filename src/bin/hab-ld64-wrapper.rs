@@ -54,7 +54,10 @@ struct LDEnvironment {
 impl Default for LDEnvironment {
     fn default() -> Self {
         Self {
-            common: CommonEnvironment::default(),
+            common: CommonEnvironment {
+                fs_root: PathBuf::from("/opt"),
+                ..Default::default()
+            },
             allowed_impure_paths: std::env::var("HAB_ALLOWED_IMPURE_PATHS")
                 .map(|value| {
                     value
